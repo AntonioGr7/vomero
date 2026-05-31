@@ -350,6 +350,52 @@ def test_planning_depth_scope():
     assert any("NameError" in o for o in sub_outputs)
 
 
+# --- interaction / ask_user -------------------------------------------------
+
+def test_ask_user_returns_feedback_and_emits_event():
+    received = []
+
+    def handler(question):
+        received.append(question)
+        return "use the staging config"
+
+    script = [
+        _py("1", "reply = ask_user('which config should I use?'); print(reply)"),
+        _py("2", "answer('using: ' + reply)"),  # REPL state persists across steps
+    ]
+    steps = []
+    out = RLMEngine(FakeClient(script), enable_interaction=True).run(
+        "q", Corpus(CORPUS), on_event=steps.append, ask_handler=handler
+    )
+
+    assert out == "using: use the staging config"  # feedback incorporated
+    assert received == ["which config should I use?"]
+    inter = [s.interaction for s in steps if s.interaction is not None]
+    assert len(inter) == 1
+    assert inter[0].question == "which config should I use?"
+    assert inter[0].answer == "use the staging config"
+
+
+def test_ask_user_degrades_gracefully_without_handler():
+    script = [_py("1", "r = ask_user('x'); print(r)"), _py("2", "answer('ok')")]
+    steps = []
+    # enabled, but no ask_handler (headless) — must not hang.
+    RLMEngine(FakeClient(script), enable_interaction=True).run(
+        "q", Corpus(CORPUS), on_event=steps.append
+    )
+    outputs = [s.output for s in steps if s.output]
+    assert any("No user is available" in o for o in outputs)
+
+
+def test_ask_user_absent_unless_enabled():
+    script = [_py("1", "ask_user('x')"), _py("2", "answer('ok')")]
+    steps = []
+    RLMEngine(FakeClient(script)).run("q", Corpus(CORPUS), on_event=steps.append)
+    outputs = [s.output for s in steps if s.output]
+    assert any("NameError" in o for o in outputs)
+    assert all(s.interaction is None for s in steps)
+
+
 def test_todo_bad_index_raises_clear_error():
     from vomero.engine.todo import TodoList
 

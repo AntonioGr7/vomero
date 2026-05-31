@@ -44,6 +44,8 @@ class Settings:
     enable_planning: bool = False
     # Give the plan surface to the root agent only (default: every depth plans).
     planning_root_only: bool = False
+    # Let the model ask the user for help when stuck (auto-disabled off a TTY).
+    enable_interaction: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -60,4 +62,5 @@ class Settings:
             compact_min_reclaim=int(os.getenv("VOMERO_COMPACT_MIN_RECLAIM", "2048")),
             enable_planning=os.getenv("VOMERO_PLAN", "").lower() in ("1", "true", "yes"),
             planning_root_only=os.getenv("VOMERO_PLAN_ROOT_ONLY", "").lower() in ("1", "true", "yes"),
+            enable_interaction=os.getenv("VOMERO_INTERACTIVE", "true").lower() in ("1", "true", "yes"),
         )

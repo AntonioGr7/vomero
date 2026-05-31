@@ -104,6 +104,22 @@ exactly one item in progress at a time. You do NOT need to print the list; it is
 shown to the user automatically, so keep it out of your printed output."""
 
 
+# Appended to the system prompt only when interaction is enabled.
+INTERACTION_PROMPT = """
+
+You can ask the user for help when you are genuinely stuck:
+
+  ask_user(question) -> str   Pause and ask the user a question; returns their
+                              reply as a string.
+
+Use it SPARINGLY and only when proceeding would mean guessing on something that
+matters: the request is ambiguous, you are missing information only the user has,
+or you face a consequential decision the data cannot resolve. Explore the corpus
+first — never ask what you could find yourself. Ask one specific, answerable
+question at a time, then capture the reply (e.g. `reply = ask_user(...)`), act on
+it, and reflect it in your final answer."""
+
+
 @dataclass
 class LLMCall:
     """A flat `llm()` distillation sub-call — surfaced so the trace explains
@@ -113,6 +129,14 @@ class LLMCall:
     prompt: str
     response: str
     tokens: int  # cumulative-total delta this call cost
+
+
+@dataclass
+class Interaction:
+    """A round-trip where the model asked the user something and got a reply."""
+
+    question: str
+    answer: str
 
 
 @dataclass
@@ -128,6 +152,8 @@ class Step:
     message: str | None = None
     # The current plan, emitted whenever the model mutates the TODO surface.
     todo: list[TodoItem] | None = None
+    # Set when the model asked the user a question and received a reply.
+    interaction: Interaction | None = None
     # Token-accounting snapshot, emitted right after each model call.
     usage: UsageSnapshot | None = None
     # Set on the step where history was compacted.
@@ -148,6 +174,7 @@ class RLMEngine:
         compactor: Compactor | None = None,
         enable_planning: bool = False,
         planning_root_only: bool = False,
+        enable_interaction: bool = False,
     ):
         self.client = client
         self.env_factory = env_factory
@@ -159,6 +186,8 @@ class RLMEngine:
         # By default every depth keeps its own plan (recursive sub-agents plan
         # too). Set True to give the plan surface to the root agent only.
         self.planning_root_only = planning_root_only
+        # When True, inject `ask_user` and tell the model it may ask for help.
+        self.enable_interaction = enable_interaction
         # Optional history compaction. None => never compact (small corpora,
         # tests). Shared across the recursion; each loop compacts its own stack.
         self.compactor = compactor
@@ -175,6 +204,7 @@ class RLMEngine:
         depth: int = 0,
         on_event: Callable[[Step], None] | None = None,
         meter: UsageMeter | None = None,
+        ask_handler: Callable[[str], str] | None = None,
     ) -> str:
         # Top-level run owns a fresh meter; recursive sub-calls share it so the
         # cumulative figure spans the whole tree.
@@ -190,6 +220,20 @@ class RLMEngine:
 
         def answer(text) -> None:
             holder["value"] = str(text)
+
+        def ask_user(question: str) -> str:
+            q = str(question)
+            if ask_handler is None:
+                # Headless: don't hang. Tell the model to proceed autonomously.
+                reply = ("No user is available to answer (running "
+                         "non-interactively). Proceed with your best judgment "
+                         "and state any assumptions in your answer.")
+            else:
+                reply = str(ask_handler(q))
+            if on_event:
+                on_event(Step(depth=depth, index=current["index"],
+                              interaction=Interaction(question=q, answer=reply)))
+            return reply
 
         def llm(text: str, system: str | None = None) -> str:
             msgs = []
@@ -221,6 +265,7 @@ class RLMEngine:
                 depth=depth + 1,
                 on_event=on_event,
                 meter=meter,
+                ask_handler=ask_handler,
             )
 
         names = dict(corpus=corpus, llm=llm, rlm=rlm, answer=answer)
@@ -234,6 +279,9 @@ class RLMEngine:
                     on_event(Step(depth=depth, index=current["index"], todo=items))
 
             names["todo"] = TodoList(on_todo_change)
+        if self.enable_interaction:
+            system_prompt += INTERACTION_PROMPT
+            names["ask_user"] = ask_user
         env.inject(**names)
 
         messages: list[Message] = [

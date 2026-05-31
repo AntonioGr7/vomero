@@ -135,6 +135,26 @@ vomero ask "What blocks P-BEACON, and who owns the fix?" \
   --data examples/sample_corpus --plan
 ```
 
+## Interactivity (ask the user for help)
+
+The model can ask you for help when it's genuinely stuck — an ambiguous request,
+missing information only you have, or a consequential decision the data can't
+resolve. It calls `ask_user(question)` from the REPL; the loop pauses, prompts
+you on the terminal, and feeds your reply back as the function's return value,
+which the model incorporates into its work:
+
+```
+❓ The assistant needs your input:
+   P-BEACON is blocked by P-ATLAS — recommend waiting, or propose a workaround?
+   > ship after the auth library lands
+```
+
+On by default when running on a terminal; auto-disabled when stdin is piped, and
+`--no-interactive` (or `VOMERO_INTERACTIVE=0`) turns it off. Headless (no
+prompter) is safe: `ask_user` returns a "no user available, proceed with best
+judgment" reply instead of hanging. The model is told to ask *sparingly* —
+explore the corpus first, ask only when proceeding would mean guessing.
+
 ## Roadmap (next)
 
 - Interactive `vomero chat` (multi-turn, persistent REPL across questions).

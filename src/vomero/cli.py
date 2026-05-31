@@ -68,11 +68,33 @@ def _verbose_printer():
         elif step.output is not None:
             snippet = step.output if len(step.output) < 1500 else step.output[:1500] + " …[truncated]"
             print(f"{tag} -> " + snippet.replace("\n", "\n" + pad + "     "), file=stream)
+        elif step.interaction is not None:
+            it = step.interaction
+            print(f"{tag} ❓ asked: {_clip(it.question, 200)}\n"
+                  f"{pad}   ↳ user: {_clip(it.answer, 200)}", file=stream)
         elif step.final is not None:
             print(f"{tag} FINAL (depth {step.depth}):\n{pad}  "
                   + step.final.replace("\n", "\n" + pad + "  "), file=stream)
 
     return emit
+
+
+def _terminal_ask_handler():
+    """Prompt the real user on the terminal.
+
+    Binds the real stdout/stdin now, because `ask_user` is called from inside
+    `env.execute()`, which redirects sys.stdout/stderr to capture the model's
+    own output — a late lookup would send the prompt into that buffer."""
+    out = sys.stderr
+    src = sys.stdin
+
+    def ask(question: str) -> str:
+        print(f"\n\033[1m❓ The assistant needs your input:\033[0m\n   {question}", file=out)
+        print("   > ", end="", file=out, flush=True)
+        line = src.readline()
+        return line.rstrip("\n") if line else "(no answer provided)"
+
+    return ask
 
 
 _TODO_GLYPH = {"completed": "✔", "in_progress": "▶", "pending": "☐"}
@@ -122,6 +144,10 @@ def cmd_ask(args: argparse.Namespace) -> int:
     if args.plan_root_only:
         settings.enable_planning = True
         settings.planning_root_only = True
+    if args.no_interactive:
+        settings.enable_interaction = False
+    # Interaction needs a real terminal to prompt on; auto-disable when piped.
+    interactive = settings.enable_interaction and sys.stdin.isatty()
 
     try:
         corpus = Corpus(args.data)
@@ -147,13 +173,15 @@ def cmd_ask(args: argparse.Namespace) -> int:
         compactor=compactor,
         enable_planning=settings.enable_planning,
         planning_root_only=settings.planning_root_only,
+        enable_interaction=interactive,
     )
 
     on_event = _compose(
         _verbose_printer() if args.verbose else None,
         _plan_printer() if settings.enable_planning else None,
     )
-    answer = engine.run(args.question, corpus, on_event=on_event)
+    ask_handler = _terminal_ask_handler() if interactive else None
+    answer = engine.run(args.question, corpus, on_event=on_event, ask_handler=ask_handler)
     if args.verbose:
         print("\n" + "=" * 60, file=sys.stderr)
     print(answer)
@@ -190,6 +218,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Let the model maintain a live TODO plan, shown as a checklist.")
     ask.add_argument("--plan-root-only", action="store_true",
                      help="Enable planning, but for the root agent only (sub-agents don't plan).")
+    ask.add_argument("--no-interactive", action="store_true",
+                     help="Don't let the model ask the user for help (also auto-off when piped).")
     ask.add_argument("-v", "--verbose", action="store_true", help="Stream the model's code/output to stderr.")
     ask.set_defaults(func=cmd_ask)
     return p
