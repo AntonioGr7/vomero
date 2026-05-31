@@ -40,6 +40,11 @@ class Settings:
     compact_keep_recent: int = 6
     compact_min_reclaim: int = 2048
 
+    # Show a live plan/TODO checklist driven by the model.
+    enable_planning: bool = False
+    # Give the plan surface to the root agent only (default: every depth plans).
+    planning_root_only: bool = False
+
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
@@ -53,4 +58,6 @@ class Settings:
             compact_ratio=float(os.getenv("VOMERO_COMPACT_RATIO", "0.8")),
             compact_keep_recent=int(os.getenv("VOMERO_COMPACT_KEEP_RECENT", "6")),
             compact_min_reclaim=int(os.getenv("VOMERO_COMPACT_MIN_RECLAIM", "2048")),
+            enable_planning=os.getenv("VOMERO_PLAN", "").lower() in ("1", "true", "yes"),
+            planning_root_only=os.getenv("VOMERO_PLAN_ROOT_ONLY", "").lower() in ("1", "true", "yes"),
         )

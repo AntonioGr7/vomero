@@ -109,6 +109,32 @@ vomero ask "…" --data ./data --context-window 32000 --compact-ratio 0.75 -v
 vomero ask "…" --data ./data --no-compact     # disable
 ```
 
+## Planning (live TODO checklist)
+
+With `--plan`, the model maintains a plan you watch tick off in real time — the
+"here's what I'm doing" view. It drives a `todo` surface from the REPL
+(`todo.plan([...])`, `todo.start(n)`, `todo.complete(n)`, `todo.add(...)`), and
+each change reprints the checklist:
+
+```
+Plan (1/3 done):
+  ✔ Locate P-BEACON file
+  ▶ Find its blocker
+  ☐ Identify owning team
+```
+
+It's opt-in (off by default; `--plan` or `VOMERO_PLAN=1`) and pairs with `-v`.
+The checklist is host-side observability — it's kept out of the model's own
+context, so it costs no tokens in the loop. By default each recursive `rlm()`
+sub-agent keeps its own plan (rendered indented by depth); pass
+`--plan-root-only` (or `VOMERO_PLAN_ROOT_ONLY=1`) to give the plan surface to the
+root agent alone.
+
+```bash
+vomero ask "What blocks P-BEACON, and who owns the fix?" \
+  --data examples/sample_corpus --plan
+```
+
 ## Roadmap (next)
 
 - Interactive `vomero chat` (multi-turn, persistent REPL across questions).

@@ -75,6 +75,34 @@ def _verbose_printer():
     return emit
 
 
+_TODO_GLYPH = {"completed": "✔", "in_progress": "▶", "pending": "☐"}
+
+
+def _plan_printer():
+    """Renders the live plan checklist on each TODO mutation (the `--plan` view)."""
+    stream = sys.stderr  # bind real stderr (see _verbose_printer for why)
+
+    def emit(step: Step) -> None:
+        if step.todo is None:
+            return
+        pad = "  " * step.depth
+        done = sum(1 for it in step.todo if it.status == "completed")
+        lines = [f"{pad}Plan ({done}/{len(step.todo)} done):"]
+        for it in step.todo:
+            lines.append(f"{pad}  {_TODO_GLYPH.get(it.status, '?')} {it.text}")
+        print("\n".join(lines), file=stream)
+
+    return emit
+
+
+def _compose(*emitters):
+    """Fan one event out to several emitters; None if there are none."""
+    active = [e for e in emitters if e is not None]
+    if not active:
+        return None
+    return lambda step: [e(step) for e in active]
+
+
 def cmd_ask(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
     if args.model:
@@ -89,6 +117,11 @@ def cmd_ask(args: argparse.Namespace) -> int:
         settings.compact_ratio = args.compact_ratio
     if args.no_compact:
         settings.compact_ratio = 0.0
+    if args.plan:
+        settings.enable_planning = True
+    if args.plan_root_only:
+        settings.enable_planning = True
+        settings.planning_root_only = True
 
     try:
         corpus = Corpus(args.data)
@@ -112,9 +145,14 @@ def cmd_ask(args: argparse.Namespace) -> int:
         max_steps=settings.max_steps,
         max_depth=settings.max_depth,
         compactor=compactor,
+        enable_planning=settings.enable_planning,
+        planning_root_only=settings.planning_root_only,
     )
 
-    on_event = _verbose_printer() if args.verbose else None
+    on_event = _compose(
+        _verbose_printer() if args.verbose else None,
+        _plan_printer() if settings.enable_planning else None,
+    )
     answer = engine.run(args.question, corpus, on_event=on_event)
     if args.verbose:
         print("\n" + "=" * 60, file=sys.stderr)
@@ -148,6 +186,10 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--compact-ratio", type=float, default=None,
                      help="Compact when context reaches this fraction of the window (default 0.8).")
     ask.add_argument("--no-compact", action="store_true", help="Disable history compaction.")
+    ask.add_argument("--plan", action="store_true",
+                     help="Let the model maintain a live TODO plan, shown as a checklist.")
+    ask.add_argument("--plan-root-only", action="store_true",
+                     help="Enable planning, but for the root agent only (sub-agents don't plan).")
     ask.add_argument("-v", "--verbose", action="store_true", help="Stream the model's code/output to stderr.")
     ask.set_defaults(func=cmd_ask)
     return p

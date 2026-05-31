@@ -24,6 +24,7 @@ from ..env import ExecutionEnvironment, InProcessEnvironment
 from ..llm.base import LLMClient, Message, ToolSpec
 from ..usage import UsageMeter, UsageSnapshot, estimate_message_tokens
 from .compaction import Compactor, CompactionEvent
+from .todo import TodoItem, TodoList
 
 # The single tool the root model gets. Keeping it to one tool (run Python)
 # maps cleanly onto every provider's function-calling and matches the RLM idea:
@@ -88,6 +89,21 @@ Strategy:
 Keep each code block small and purposeful. Print only what you need to see."""
 
 
+# Appended to the system prompt only when planning is enabled.
+PLANNING_PROMPT = """
+
+You also have a TODO surface to externalize your plan — the user watches it live:
+
+  todo.plan([...])   Set your step-by-step plan. Call this FIRST, before exploring.
+  todo.start(n)      Mark item n (1-based) in progress, right before you work on it.
+  todo.complete(n)   Mark item n done, right after you finish it.
+  todo.add("...")    Append a step you discover mid-task.
+
+Keep the plan to a handful of concrete, verifiable steps. Update it as you go —
+exactly one item in progress at a time. You do NOT need to print the list; it is
+shown to the user automatically, so keep it out of your printed output."""
+
+
 @dataclass
 class LLMCall:
     """A flat `llm()` distillation sub-call — surfaced so the trace explains
@@ -110,6 +126,8 @@ class Step:
     final: str | None = None
     # Assistant natural-language content emitted alongside a tool call.
     message: str | None = None
+    # The current plan, emitted whenever the model mutates the TODO surface.
+    todo: list[TodoItem] | None = None
     # Token-accounting snapshot, emitted right after each model call.
     usage: UsageSnapshot | None = None
     # Set on the step where history was compacted.
@@ -128,12 +146,19 @@ class RLMEngine:
         max_steps: int = 24,
         max_depth: int = 3,
         compactor: Compactor | None = None,
+        enable_planning: bool = False,
+        planning_root_only: bool = False,
     ):
         self.client = client
         self.env_factory = env_factory
         self.model = model
         self.max_steps = max_steps
         self.max_depth = max_depth
+        # When True, inject a `todo` plan surface and tell the model to use it.
+        self.enable_planning = enable_planning
+        # By default every depth keeps its own plan (recursive sub-agents plan
+        # too). Set True to give the plan surface to the root agent only.
+        self.planning_root_only = planning_root_only
         # Optional history compaction. None => never compact (small corpora,
         # tests). Shared across the recursion; each loop compacts its own stack.
         self.compactor = compactor
@@ -198,10 +223,21 @@ class RLMEngine:
                 meter=meter,
             )
 
-        env.inject(corpus=corpus, llm=llm, rlm=rlm, answer=answer)
+        names = dict(corpus=corpus, llm=llm, rlm=rlm, answer=answer)
+        system_prompt = SYSTEM_PROMPT
+        planning_here = self.enable_planning and (not self.planning_root_only or depth == 0)
+        if planning_here:
+            system_prompt += PLANNING_PROMPT
+
+            def on_todo_change(items: list[TodoItem]) -> None:
+                if on_event:
+                    on_event(Step(depth=depth, index=current["index"], todo=items))
+
+            names["todo"] = TodoList(on_todo_change)
+        env.inject(**names)
 
         messages: list[Message] = [
-            Message("system", SYSTEM_PROMPT),
+            Message("system", system_prompt),
             Message("user", question),
         ]
 

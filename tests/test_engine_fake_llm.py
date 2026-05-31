@@ -282,3 +282,82 @@ def test_trace_surfaces_llm_subcalls_and_final_text():
 
     finals = [s for s in steps if s.final is not None]
     assert finals and finals[0].final == "the final answer"  # text carried, not a marker
+
+
+# --- planning / TODO surface -------------------------------------------------
+
+def test_planning_surface_emits_todo_events_when_enabled():
+    script = [
+        _py("1", "todo.plan(['find file', 'identify blocker']); todo.start(1)"),
+        _py("2", "todo.complete(1); todo.start(2)"),
+        _py("3", "todo.complete(2); answer('done')"),
+    ]
+    steps = []
+    out = RLMEngine(FakeClient(script), enable_planning=True).run(
+        "q", Corpus(CORPUS), on_event=steps.append
+    )
+    assert out == "done"
+
+    todos = [s.todo for s in steps if s.todo is not None]
+    # plan + start + complete + start + complete = 5 mutation events
+    assert len(todos) == 5
+    # First event: both pending. Final event: both completed.
+    assert [it.status for it in todos[0]] == ["pending", "pending"]
+    assert [it.status for it in todos[-1]] == ["completed", "completed"]
+    # Mid-run there is exactly one in_progress at the right moment.
+    assert [it.status for it in todos[1]] == ["in_progress", "pending"]
+
+
+def test_todo_surface_absent_unless_enabled():
+    script = [_py("1", "todo.plan(['x'])"), _py("2", "answer('done')")]
+    steps = []
+    out = RLMEngine(FakeClient(script)).run("q", Corpus(CORPUS), on_event=steps.append)
+
+    assert out == "done"
+    assert all(s.todo is None for s in steps)
+    # Referencing `todo` raises NameError, surfaced to the model for self-correction.
+    outputs = [s.output for s in steps if s.output]
+    assert any("NameError" in o for o in outputs)
+
+
+def test_planning_depth_scope():
+    # A root step delegates to rlm(); the sub-agent then tries to use `todo`.
+    # Default: sub-agent has its own plan. root_only: sub-agent has no `todo`.
+    # rlm() runs *inside* the root's first step, so the actual order of
+    # complete() calls across the tree is: root#1, sub#1, sub#2, root#2.
+    def make_client():
+        return FakeClient([
+            _py("r1", "print(rlm('subq'))"),       # root step 1 — delegates
+            _py("s1", "todo.plan(['sub step'])"),   # sub step 1 — uses todo
+            _py("s2", "answer('sub done')"),         # sub step 2 — finishes
+            _py("r2", "answer('root done')"),        # root step 2 — finishes
+        ])
+
+    # Default — every depth plans: the sub-agent emits todo events at depth 1.
+    steps = []
+    RLMEngine(make_client(), enable_planning=True).run(
+        "q", Corpus(CORPUS), on_event=steps.append
+    )
+    assert any(s.todo is not None and s.depth == 1 for s in steps)
+
+    # Root-only — the sub-agent has no `todo` surface (NameError), no todo events at depth 1.
+    steps = []
+    RLMEngine(make_client(), enable_planning=True, planning_root_only=True).run(
+        "q", Corpus(CORPUS), on_event=steps.append
+    )
+    assert not any(s.todo is not None and s.depth == 1 for s in steps)
+    sub_outputs = [s.output for s in steps if s.output and s.depth == 1]
+    assert any("NameError" in o for o in sub_outputs)
+
+
+def test_todo_bad_index_raises_clear_error():
+    from vomero.engine.todo import TodoList
+
+    events = []
+    todo = TodoList(events.append)
+    todo.plan(["only one"])
+    try:
+        todo.complete(5)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "out of range" in str(e)
