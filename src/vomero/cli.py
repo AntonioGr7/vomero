@@ -23,7 +23,19 @@ from .engine.rlm import Step
 from .llm import build_client
 
 
+def _clip(text: str, limit: int) -> str:
+    """Collapse whitespace and truncate, for one-line previews."""
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + " …"
+
+
 def _verbose_printer():
+    # Bind the real stderr now. `llm()`/`rlm()` events fire from inside
+    # `env.execute()`, which redirects sys.stderr to capture the model's own
+    # output — so a late `sys.stderr` lookup would land trace lines in that
+    # buffer instead of the terminal. Capturing it here keeps them separate.
+    stream = sys.stderr
+
     def emit(step: Step) -> None:
         pad = "  " * step.depth
         tag = f"{pad}[d{step.depth}.{step.index}]"
@@ -33,7 +45,7 @@ def _verbose_printer():
                 f"{tag} ⟳ compacted {c.summarized_messages} msg(s): "
                 f"~{c.tokens_before:,} → ~{c.tokens_after:,} tok "
                 f"({c.messages_before} → {c.messages_after} msgs)",
-                file=sys.stderr,
+                file=stream,
             )
         elif step.usage is not None:
             u = step.usage
@@ -41,16 +53,24 @@ def _verbose_printer():
             tot_approx = "~" if u.cumulative_estimated else ""
             print(
                 f"{tag} ctx {ctx_approx}{u.context_tokens:,} tok | total {tot_approx}{u.cumulative_tokens:,} tok",
-                file=sys.stderr,
+                file=stream,
             )
+        elif step.message is not None:
+            print(f"{tag} 💬 " + step.message.replace("\n", "\n" + pad + "   "), file=stream)
         elif step.code is not None:
             print(f"\n{tag} python:\n{pad}  " + step.code.replace("\n", "\n" + pad + "  "),
-                  file=sys.stderr)
+                  file=stream)
+        elif step.llm_call is not None:
+            c = step.llm_call
+            print(f"{tag} llm() distilled (+{c.tokens:,} tok)\n"
+                  f"{pad}  in : {_clip(c.prompt, 160)}\n"
+                  f"{pad}  out: {_clip(c.response, 300)}", file=stream)
         elif step.output is not None:
             snippet = step.output if len(step.output) < 1500 else step.output[:1500] + " …[truncated]"
-            print(f"{tag} -> " + snippet.replace("\n", "\n" + pad + "     "), file=sys.stderr)
+            print(f"{tag} -> " + snippet.replace("\n", "\n" + pad + "     "), file=stream)
         elif step.final is not None:
-            print(f"{tag} FINAL (depth {step.depth})", file=sys.stderr)
+            print(f"{tag} FINAL (depth {step.depth}):\n{pad}  "
+                  + step.final.replace("\n", "\n" + pad + "  "), file=stream)
 
     return emit
 

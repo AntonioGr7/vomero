@@ -252,3 +252,33 @@ def test_loop_compacts_when_context_crosses_threshold():
     assert len(events) == 1 and events[0].summarized_messages == 2
     # Cumulative accounting includes the 3 tool turns + the summarization call.
     assert engine.last_usage.calls == 4
+
+
+def test_trace_surfaces_llm_subcalls_and_final_text():
+    class Client:
+        def __init__(self):
+            self.tool_calls = 0
+
+        def complete(self, messages, *, tools=None, model=None, temperature=None):
+            if not tools:  # the flat llm() distillation sub-call
+                return LLMResponse(content="distilled summary", tool_calls=[],
+                                   usage=Usage(prompt_tokens=50, completion_tokens=5))
+            self.tool_calls += 1
+            if self.tool_calls == 1:
+                return _py("1", "out = llm('summarize X'); print(out)",
+                           usage=Usage(prompt_tokens=100, completion_tokens=8))
+            return _py("2", "answer('the final answer')",
+                       usage=Usage(prompt_tokens=120, completion_tokens=8))
+
+    steps = []
+    out = RLMEngine(Client()).run("q", Corpus(CORPUS), on_event=steps.append)
+
+    assert out == "the final answer"
+
+    llm_calls = [s for s in steps if s.llm_call is not None]
+    assert len(llm_calls) == 1
+    assert llm_calls[0].llm_call.response == "distilled summary"
+    assert llm_calls[0].llm_call.tokens == 55  # 50 prompt + 5 completion, metered
+
+    finals = [s for s in steps if s.final is not None]
+    assert finals and finals[0].final == "the final answer"  # text carried, not a marker

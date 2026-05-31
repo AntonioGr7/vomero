@@ -89,6 +89,17 @@ Keep each code block small and purposeful. Print only what you need to see."""
 
 
 @dataclass
+class LLMCall:
+    """A flat `llm()` distillation sub-call — surfaced so the trace explains
+    every token spent (these calls move the cumulative total but run inside the
+    model's code, so they'd otherwise be invisible)."""
+
+    prompt: str
+    response: str
+    tokens: int  # cumulative-total delta this call cost
+
+
+@dataclass
 class Step:
     """One turn in the loop — handed to `on_event` for observability."""
 
@@ -97,10 +108,14 @@ class Step:
     code: str | None = None
     output: str | None = None
     final: str | None = None
+    # Assistant natural-language content emitted alongside a tool call.
+    message: str | None = None
     # Token-accounting snapshot, emitted right after each model call.
     usage: UsageSnapshot | None = None
     # Set on the step where history was compacted.
     compaction: CompactionEvent | None = None
+    # A flat `llm()` sub-call made from within the model's code this step.
+    llm_call: LLMCall | None = None
 
 
 class RLMEngine:
@@ -144,6 +159,9 @@ class RLMEngine:
 
         env = self.env_factory()
         holder: dict[str, str] = {}
+        # Live step index, so sub-calls made from inside the model's code (which
+        # runs mid-step) can tag their events with the step they belong to.
+        current: dict[str, int] = {"index": 0}
 
         def answer(text) -> None:
             holder["value"] = str(text)
@@ -153,10 +171,18 @@ class RLMEngine:
             if system:
                 msgs.append(Message("system", system))
             msgs.append(Message("user", text))
+            before = meter.total_tokens
             resp = self.client.complete(msgs, model=self.model)
             # A flat sub-call still spends tokens; fold it into the shared total.
             meter.record(resp.usage, sent_messages=msgs, response_text=resp.content)
-            return resp.content or ""
+            out = resp.content or ""
+            if on_event:
+                on_event(Step(
+                    depth=depth, index=current["index"],
+                    llm_call=LLMCall(prompt=text, response=out,
+                                     tokens=meter.total_tokens - before),
+                ))
+            return out
 
         def rlm(sub_question: str, paths: list[str] | None = None) -> str:
             if depth + 1 > self.max_depth:
@@ -180,6 +206,7 @@ class RLMEngine:
         ]
 
         for i in range(self.max_steps):
+            current["index"] = i
             resp = self.client.complete(messages, tools=[PYTHON_TOOL], model=self.model)
             # Record before appending the reply: `messages` is exactly the
             # context we just sent, so its size is this step's context gauge.
@@ -191,6 +218,9 @@ class RLMEngine:
                     depth=depth, index=i,
                     usage=meter.snapshot(context_tokens, context_estimated),
                 ))
+                # Natural-language the model emitted alongside its tool call.
+                if resp.content and resp.tool_calls:
+                    on_event(Step(depth=depth, index=i, message=resp.content))
             step_start = len(messages)  # for projecting this step's growth
             messages.append(
                 Message("assistant", content=resp.content, tool_calls=resp.tool_calls)
