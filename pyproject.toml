@@ -1,0 +1,30 @@
+[project]
+name = "vomero"
+version = "0.0.1"
+description = "A coding/data assistant built on the Recursive Language Model (RLM) idea: context lives in a REPL variable and is navigated programmatically, not stuffed into the prompt."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    "openai>=1.40",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+vomero = "vomero.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vomero"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
