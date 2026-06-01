@@ -29,7 +29,7 @@ sub-corpus), and `answer()`.
 ```
 src/vomero/
   llm/        provider-agnostic client (base protocol + OpenAI impl)   [ADR 0002]
-  env/        swappable execution backend (in-process now)             [ADR 0001]
+  execution/  swappable execution backend: in-process + gVisor sandbox [ADR 0001/0004]
   context/    Corpus — lazy navigable view over the data folder
   engine/     RLMEngine — the recursive REPL loop  + system prompt
   config.py   env-driven settings
@@ -69,9 +69,112 @@ uv run pytest        # no API key required
   vLLM, LM Studio, OpenRouter, local) and **Gemini** (`VOMERO_PROVIDER=gemini`,
   via its OpenAI-compatible endpoint). Anthropic slots in behind the same
   `LLMClient` protocol — see [ADR 0002](docs/adr/0002-model-provider-abstraction.md).
-- **Execution:** in-process `exec` (fast, full-power, **not sandboxed** — trusted
-  personal use only). The `ExecutionEnvironment` interface is the seam where a
-  sandbox lands later — see [ADR 0001](docs/adr/0001-execution-environment.md).
+- **Execution:** two backends behind one `ExecutionEnvironment` seam.
+  - *in-process* `exec` (default) — fast, full-power, **not sandboxed**; for
+    trusted local/dev use. See [ADR 0001](docs/adr/0001-execution-environment.md).
+  - *gVisor sandbox* (opt-in) — runs each step in a `runsc` container with hard
+    memory/CPU caps, no network, read-only corpus, non-root, no host filesystem
+    access. The host-stateful helpers (`llm`/`rlm`/`answer`/…) stay available
+    via an RPC surface. See [ADR 0004](docs/adr/0004-gvisor-sandbox.md).
+
+### Sandboxed execution (gVisor)
+
+By default the model's code runs in-process with `exec` — fast, but it can touch
+the host's filesystem and network. For untrusted input (or just to be safe), the
+**gVisor sandbox** runs each step inside an isolated `runsc` container with hard
+memory/CPU caps, no network, a read-only corpus, and no host filesystem access.
+It's **off by default** and opt-in per run.
+
+#### 1. Prerequisites
+
+You need Docker, plus the [`runsc` (gVisor) runtime](https://gvisor.dev/docs/user_guide/install/)
+registered with the Docker daemon:
+
+```bash
+# Install gVisor (see the link above for your platform), then register it:
+sudo runsc install          # writes the "runsc" runtime into /etc/docker/daemon.json
+sudo systemctl restart docker
+
+# Verify Docker can see it:
+docker run --rm --runtime=runsc hello-world
+```
+
+The default image is `python:3.11-slim`; it's pulled automatically on first use
+(so the first run may take longer — see `VOMERO_SANDBOX_STARTUP_TIMEOUT`).
+
+#### 2. Run it
+
+```bash
+# Turn it on per-run and size the container:
+vomero ask "What blocks P-BEACON?" --data ./data \
+  --sandbox --sandbox-memory 1g --sandbox-cpus 2
+
+# Or via the environment — also applies to `vomero serve`:
+VOMERO_SANDBOX=1 VOMERO_SANDBOX_MEMORY=1g VOMERO_SANDBOX_CPUS=2 \
+  vomero ask "..." --data ./data
+
+# Serve a corpus with isolated execution (the warning banner flips to 🔒):
+VOMERO_SANDBOX=1 vomero serve --data ./data --port 8000
+```
+
+CLI flags: `--sandbox`, `--sandbox-memory`, `--sandbox-cpus`, `--sandbox-image`,
+`--sandbox-runtime`. They override the environment for that run.
+
+#### 3. Configuration
+
+| Env var | CLI flag | Default | What it does |
+|---|---|---|---|
+| `VOMERO_SANDBOX=1` | `--sandbox` | off | Shortcut for `VOMERO_EXEC_BACKEND=sandbox` |
+| `VOMERO_EXEC_BACKEND` | — | `inprocess` | `inprocess` or `sandbox` |
+| `VOMERO_SANDBOX_MEMORY` | `--sandbox-memory` | `512m` | Hard memory cap (e.g. `1g`, `2g`) |
+| `VOMERO_SANDBOX_CPUS` | `--sandbox-cpus` | `1.0` | Fractional vCPUs (e.g. `0.5`, `2`) |
+| `VOMERO_SANDBOX_IMAGE` | `--sandbox-image` | `python:3.11-slim` | Container image |
+| `VOMERO_SANDBOX_RUNTIME` | `--sandbox-runtime` | `runsc` | OCI runtime (gVisor) |
+| `VOMERO_SANDBOX_NETWORK` | — | `none` | Docker `--network` |
+| `VOMERO_SANDBOX_PIDS` | — | `256` | Max processes (fork-bomb guard) |
+| `VOMERO_SANDBOX_STARTUP_TIMEOUT` | — | `60` | Seconds to wait for the container (first run pulls the image) |
+
+#### Code that needs third-party libraries
+
+The default image only has Python's stdlib. If the model's code needs `pandas`,
+`numpy`, etc., point the sandbox at an image that has them — Vomero's own source
+is bind-mounted in at runtime, so the image needs **only** Python plus your deps:
+
+```dockerfile
+# Dockerfile.sandbox
+FROM python:3.11-slim
+RUN pip install --no-cache-dir pandas numpy
+```
+
+```bash
+docker build -t vomero-sandbox -f Dockerfile.sandbox .
+VOMERO_SANDBOX=1 VOMERO_SANDBOX_IMAGE=vomero-sandbox \
+  vomero ask "..." --data ./data
+```
+
+#### How it works (you don't launch the agent — Vomero does)
+
+There's no separate process to start: the container and the in-sandbox **agent**
+are launched automatically, lazily, on the first line of code the model runs.
+Per run:
+
+1. Vomero opens a Unix control socket on a temp dir and runs
+   `docker run --runtime=runsc … python …/agent.py <socket> <corpus.py>`,
+   bind-mounting your corpus **read-only** at `/corpus`, the agent + `corpus.py`,
+   and the socket dir. It runs as your host `uid:gid` (non-root in the container).
+2. The agent connects back, rebuilds `corpus` locally over the mount, and turns
+   `llm`/`rlm`/`answer`/`ask_user`/`todo` into **RPC stubs**.
+3. Each REPL step ships code over the socket; the agent `exec`s it and streams
+   stdout/errors back. When the code calls a helper, it round-trips to the host
+   (which holds the real engine/LLM/recursion) and returns the result. The
+   corpus is local, so `grep`/`read` stay fast.
+4. The container is **reused for every step of the run** (gVisor startup paid
+   once) and torn down when the run ends. An `rlm()` sub-call gets its own
+   isolated container.
+
+> Exceeding `--sandbox-memory` OOM-kills the container mid-run (a hard cap, by
+> design); the step returns a clear error. Full design in
+> [ADR 0004](docs/adr/0004-gvisor-sandbox.md).
 
 ## Token accounting
 
@@ -206,8 +309,9 @@ vomero serve --data examples/sample_corpus --port 8000
 See **[docs/serving.md](docs/serving.md)** for the protocol, event types, and
 browser / curl / Python client examples.
 
-> Before exposing this to a browser, swap `InProcessEnvironment` for a sandboxed
-> backend (ADR 0001): the model's code currently runs in-process with `exec`.
+> Before exposing this to a browser on untrusted input, turn on the gVisor
+> sandbox (`VOMERO_SANDBOX=1`, [ADR 0004](docs/adr/0004-gvisor-sandbox.md)): by
+> default the model's code runs in-process with `exec`.
 
 ## Roadmap (next)
 
@@ -215,5 +319,5 @@ browser / curl / Python client examples.
 - Output truncation at the `execute` boundary (a single oversized tool result
   can't be reclaimed by compaction — it stays in the protected tail).
 - Binary/large-file handling (PDF, parquet) via lazy adapters on `corpus`.
-- Sandboxed execution backend (ADR 0001) once running on untrusted data.
+- Sandbox: a warm container pool to cut per-run startup latency (ADR 0004).
 - Caching of `llm()`/`rlm()` sub-answers to cut cost on repeated sub-questions.

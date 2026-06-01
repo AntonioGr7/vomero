@@ -21,6 +21,7 @@ from .config import Settings
 from .context.corpus import Corpus
 from .engine import Compactor, RLMEngine
 from .engine.rlm import Step
+from .execution import build_env_factory
 from .llm import build_client
 from .usage import UsageMeter
 
@@ -151,6 +152,16 @@ def cmd_ask(args: argparse.Namespace) -> int:
         settings.enable_interaction = False
     if args.ask_root_only:
         settings.interaction_root_only = True
+    if args.sandbox:
+        settings.exec_backend = "sandbox"
+    if args.sandbox_memory is not None:
+        settings.sandbox_memory = args.sandbox_memory
+    if args.sandbox_cpus is not None:
+        settings.sandbox_cpus = args.sandbox_cpus
+    if args.sandbox_image is not None:
+        settings.sandbox_image = args.sandbox_image
+    if args.sandbox_runtime is not None:
+        settings.sandbox_runtime = args.sandbox_runtime
     # The capability stays on even when piped, so sub-agents can still consult
     # their parent (model-to-model, no human). Only reaching the *human* needs a
     # real terminal — without one, `ask_user` degrades gracefully.
@@ -174,6 +185,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
     client = build_client(settings)
     engine = RLMEngine(
         client,
+        env_factory=build_env_factory(settings),
         model=settings.model,
         max_steps=settings.max_steps,
         max_depth=settings.max_depth,
@@ -183,6 +195,14 @@ def cmd_ask(args: argparse.Namespace) -> int:
         enable_interaction=settings.enable_interaction,
         interaction_root_only=settings.interaction_root_only,
     )
+    if settings.exec_backend == "sandbox":
+        print(
+            f"[sandbox] gVisor backend: image={settings.sandbox_image} "
+            f"runtime={settings.sandbox_runtime} "
+            f"mem={settings.sandbox_memory} cpus={settings.sandbox_cpus} "
+            f"net={settings.sandbox_network}",
+            file=sys.stderr,
+        )
 
     # The shell frontend is a Channel: printers receive events, the terminal
     # handler answers ask_user. A browser frontend would swap in its own Channel.
@@ -248,6 +268,16 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Don't let the model ask the user for help (also auto-off when piped).")
     ask.add_argument("--ask-root-only", action="store_true",
                      help="Only the root agent may ask the user; sub-agents consult their parent instead.")
+    ask.add_argument("--sandbox", action="store_true",
+                     help="Run the model's code in a gVisor sandbox (isolated, capped) instead of in-process.")
+    ask.add_argument("--sandbox-memory", default=None,
+                     help="Max memory per sandbox container (e.g. 512m, 2g). Default 512m.")
+    ask.add_argument("--sandbox-cpus", type=float, default=None,
+                     help="Max vCPUs per sandbox container (fractional, e.g. 1.5). Default 1.0.")
+    ask.add_argument("--sandbox-image", default=None,
+                     help="Container image for the sandbox (default python:3.11-slim).")
+    ask.add_argument("--sandbox-runtime", default=None,
+                     help="OCI runtime for the sandbox (default runsc / gVisor).")
     ask.add_argument("-v", "--verbose", action="store_true", help="Stream the model's code/output to stderr.")
     ask.set_defaults(func=cmd_ask)
 

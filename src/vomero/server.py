@@ -38,6 +38,7 @@ from .config import Settings
 from .context.corpus import Corpus
 from .engine import Compactor, RLMEngine
 from .engine.rlm import Step
+from .execution import build_env_factory
 from .llm import build_client
 from .usage import UsageMeter
 
@@ -257,6 +258,7 @@ def build_manager(settings: Settings, data: str) -> RunManager:
         )
     engine = RLMEngine(
         build_client(settings),
+        env_factory=build_env_factory(settings),
         model=settings.model,
         max_steps=settings.max_steps,
         max_depth=settings.max_depth,
@@ -282,9 +284,16 @@ def serve(data: str, host: str = "127.0.0.1", port: int = 8000,
           file=sys.stderr)
     print("  POST /runs  ·  GET /runs/<id>/events (SSE)  ·  POST /runs/<id>/reply",
           file=sys.stderr)
-    print("\n  ⚠  NOT SANDBOXED: model-authored code runs in-process with exec. "
-          "Serve only trusted corpora/users until a sandbox lands (ADR 0001).\n",
-          file=sys.stderr)
+    if settings.exec_backend == "sandbox":
+        print(f"\n  🔒 sandbox: gVisor ({settings.sandbox_runtime}), "
+              f"mem={settings.sandbox_memory} cpus={settings.sandbox_cpus} "
+              f"net={settings.sandbox_network} — model code is isolated.\n",
+              file=sys.stderr)
+    else:
+        print("\n  ⚠  NOT SANDBOXED: model-authored code runs in-process with exec. "
+              "Serve only trusted corpora/users, or set VOMERO_SANDBOX=1 for the "
+              "gVisor backend (ADR 0001/0004).\n",
+              file=sys.stderr)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

@@ -20,7 +20,21 @@ The engine constructs and reads only those types. Each provider implements the
 protocol and translates to/from its own schema. `build_client(settings)` in
 `vomero/llm/__init__.py` maps `settings.provider` to a concrete client.
 
-v0 implements `OpenAIClient` only.
+v0 implements `OpenAIClient`, plus `GeminiClient` (provider `"gemini"`).
+
+### Gemini
+
+`GeminiClient` (`vomero/llm/gemini_client.py`) subclasses `OpenAIClient` and
+points it at Google's **OpenAI-compatible endpoint**
+(`…/v1beta/openai/`). This reuses the existing message/tool/usage translation
+verbatim — Google's compat layer accepts it — so no Gemini-specific schema code
+and no extra dependency. `build_client` substitutes a Gemini model when the
+configured one looks like an OpenAI model (so the default doesn't bounce).
+
+Trade-off: the compat layer doesn't expose Gemini-only features (thinking
+budgets, safety settings, inline files). If those are needed, add a native
+`google-genai`-based client that satisfies `LLMClient` and register it for the
+`"gemini"` provider instead — no engine change.
 
 ## Adding a provider later
 

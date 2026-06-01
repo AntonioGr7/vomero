@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ..context.corpus import Corpus
-from ..env import ExecutionEnvironment, InProcessEnvironment
+from ..execution import ExecutionEnvironment, InProcessEnvironment
 from ..llm.base import LLMClient, Message, ToolSpec
 from ..channel import Channel, CallbackChannel
 from ..usage import UsageMeter, UsageSnapshot, estimate_message_tokens

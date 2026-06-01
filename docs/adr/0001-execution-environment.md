@@ -1,7 +1,11 @@
 # ADR 0001 — Execution environment: in-process now, sandbox later
 
-Status: accepted (v0)
+Status: accepted (v0) — sandbox now implemented, see ADR 0004
 Date: 2026-05-31
+Update: 2026-06-01 — the sandbox foreseen below shipped as an optional gVisor
+backend (`vomero/execution/sandbox/`). The "one real wrinkle" was resolved as
+predicted (corpus bind-mounted read-only; helpers exposed as an RPC surface).
+In-process stays the default; the sandbox is opt-in. Details in ADR 0004.
 
 ## Context
 
@@ -12,8 +16,8 @@ written by an LLM). We need an execution backend.
 ## Decision
 
 Ship an **in-process** backend (`exec` in a persistent dict namespace,
-`vomero/env/inprocess.py`) for v0, behind the `ExecutionEnvironment` ABC
-(`vomero/env/base.py`). The engine depends only on that ABC, so the backend is
+`vomero/execution/inprocess.py`) for v0, behind the `ExecutionEnvironment` ABC
+(`vomero/execution/base.py`). The engine depends only on that ABC, so the backend is
 swappable.
 
 This is acceptable because v0 is a **personal, trusted, single-user tool**.
