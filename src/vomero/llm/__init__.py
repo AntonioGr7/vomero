@@ -31,7 +31,20 @@ def build_client(settings) -> LLMClient:
             base_url=settings.base_url,
             api_key=settings.api_key,
         )
+    if provider == "gemini":
+        from .gemini_client import DEFAULT_MODEL, GeminiClient
+
+        # If the model still looks like an OpenAI one (e.g. the default), fall
+        # back to a Gemini model so the request doesn't bounce.
+        model = settings.model
+        if not model or model.lower().startswith(("gpt", "o1", "o3", "o4")):
+            model = DEFAULT_MODEL
+        return GeminiClient(
+            model=model,
+            base_url=settings.base_url,
+            api_key=settings.api_key,
+        )
     raise ValueError(
-        f"Unknown provider {provider!r}. Implemented: 'openai'. "
+        f"Unknown provider {provider!r}. Implemented: 'openai', 'gemini'. "
         "Add a client in vomero/llm/ that satisfies the LLMClient protocol."
     )

@@ -55,7 +55,12 @@ class Settings:
             provider=os.getenv("VOMERO_PROVIDER", "openai"),
             model=os.getenv("VOMERO_MODEL", "gpt-4o-mini"),
             base_url=os.getenv("VOMERO_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
-            api_key=os.getenv("VOMERO_API_KEY") or os.getenv("OPENAI_API_KEY"),
+            api_key=(
+                os.getenv("VOMERO_API_KEY")
+                or os.getenv("OPENAI_API_KEY")
+                or os.getenv("GEMINI_API_KEY")
+                or os.getenv("GOOGLE_API_KEY")
+            ),
             max_steps=int(os.getenv("VOMERO_MAX_STEPS", "24")),
             max_depth=int(os.getenv("VOMERO_MAX_DEPTH", "3")),
             context_window=int(os.getenv("VOMERO_CONTEXT_WINDOW", "128000")),

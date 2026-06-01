@@ -66,7 +66,8 @@ uv run pytest        # no API key required
 ## Status & decisions (v0)
 
 - **Backend:** OpenAI-compatible (works with OpenAI and any compatible server —
-  vLLM, LM Studio, OpenRouter, local). Anthropic/Gemini slot in behind the same
+  vLLM, LM Studio, OpenRouter, local) and **Gemini** (`VOMERO_PROVIDER=gemini`,
+  via its OpenAI-compatible endpoint). Anthropic slots in behind the same
   `LLMClient` protocol — see [ADR 0002](docs/adr/0002-model-provider-abstraction.md).
 - **Execution:** in-process `exec` (fast, full-power, **not sandboxed** — trusted
   personal use only). The `ExecutionEnvironment` interface is the seam where a
