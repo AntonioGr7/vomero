@@ -16,11 +16,13 @@ from __future__ import annotations
 import argparse
 import sys
 
+from .channel import CallbackChannel
 from .config import Settings
 from .context.corpus import Corpus
 from .engine import Compactor, RLMEngine
 from .engine.rlm import Step
 from .llm import build_client
+from .usage import UsageMeter
 
 
 def _clip(text: str, limit: int) -> str:
@@ -70,8 +72,9 @@ def _verbose_printer():
             print(f"{tag} -> " + snippet.replace("\n", "\n" + pad + "     "), file=stream)
         elif step.interaction is not None:
             it = step.interaction
-            print(f"{tag} ❓ asked: {_clip(it.question, 200)}\n"
-                  f"{pad}   ↳ user: {_clip(it.answer, 200)}", file=stream)
+            glyph, who = ("↑", "parent") if it.kind == "parent" else ("❓", "user")
+            print(f"{tag} {glyph} asked {who}: {_clip(it.question, 200)}\n"
+                  f"{pad}   ↳ {who}: {_clip(it.answer, 200)}", file=stream)
         elif step.final is not None:
             print(f"{tag} FINAL (depth {step.depth}):\n{pad}  "
                   + step.final.replace("\n", "\n" + pad + "  "), file=stream)
@@ -146,8 +149,12 @@ def cmd_ask(args: argparse.Namespace) -> int:
         settings.planning_root_only = True
     if args.no_interactive:
         settings.enable_interaction = False
-    # Interaction needs a real terminal to prompt on; auto-disable when piped.
-    interactive = settings.enable_interaction and sys.stdin.isatty()
+    if args.ask_root_only:
+        settings.interaction_root_only = True
+    # The capability stays on even when piped, so sub-agents can still consult
+    # their parent (model-to-model, no human). Only reaching the *human* needs a
+    # real terminal — without one, `ask_user` degrades gracefully.
+    human_reachable = settings.enable_interaction and sys.stdin.isatty()
 
     try:
         corpus = Corpus(args.data)
@@ -173,29 +180,48 @@ def cmd_ask(args: argparse.Namespace) -> int:
         compactor=compactor,
         enable_planning=settings.enable_planning,
         planning_root_only=settings.planning_root_only,
-        enable_interaction=interactive,
+        enable_interaction=settings.enable_interaction,
+        interaction_root_only=settings.interaction_root_only,
     )
 
+    # The shell frontend is a Channel: printers receive events, the terminal
+    # handler answers ask_user. A browser frontend would swap in its own Channel.
     on_event = _compose(
         _verbose_printer() if args.verbose else None,
         _plan_printer() if settings.enable_planning else None,
     )
-    ask_handler = _terminal_ask_handler() if interactive else None
-    answer = engine.run(args.question, corpus, on_event=on_event, ask_handler=ask_handler)
+    ask_handler = _terminal_ask_handler() if human_reachable else None
+    channel = CallbackChannel(on_event=on_event, ask_handler=ask_handler)
+
+    # Caller owns the meter; the engine keeps no per-run state.
+    meter = UsageMeter()
+    answer = engine.run(args.question, corpus, channel=channel, meter=meter)
     if args.verbose:
         print("\n" + "=" * 60, file=sys.stderr)
     print(answer)
 
     # Always report token usage on stderr (keeps stdout to just the answer).
-    u = engine.last_usage
-    if u is not None:
-        approx = "~" if u.estimated else ""
-        print(
-            f"[usage] {u.calls} model call(s) · {approx}{u.total_tokens:,} tokens total "
-            f"({approx}{u.prompt_tokens:,} in / {approx}{u.completion_tokens:,} out)"
-            + ("  (estimated — provider did not report usage)" if u.estimated else ""),
-            file=sys.stderr,
-        )
+    approx = "~" if meter.estimated else ""
+    print(
+        f"[usage] {meter.calls} model call(s) · {approx}{meter.total_tokens:,} tokens total "
+        f"({approx}{meter.prompt_tokens:,} in / {approx}{meter.completion_tokens:,} out)"
+        + ("  (estimated — provider did not report usage)" if meter.estimated else ""),
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    from .server import serve
+
+    settings = Settings.from_env()
+    if args.model:
+        settings.model = args.model
+    try:
+        serve(args.data, host=args.host, port=args.port, settings=settings)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -220,8 +246,17 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Enable planning, but for the root agent only (sub-agents don't plan).")
     ask.add_argument("--no-interactive", action="store_true",
                      help="Don't let the model ask the user for help (also auto-off when piped).")
+    ask.add_argument("--ask-root-only", action="store_true",
+                     help="Only the root agent may ask the user; sub-agents consult their parent instead.")
     ask.add_argument("-v", "--verbose", action="store_true", help="Stream the model's code/output to stderr.")
     ask.set_defaults(func=cmd_ask)
+
+    srv = sub.add_parser("serve", help="Serve the corpus over HTTP/SSE for a browser or external client.")
+    srv.add_argument("--data", required=True, help="Path to the data folder (the corpus).")
+    srv.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1).")
+    srv.add_argument("--port", type=int, default=8000, help="Bind port (default 8000).")
+    srv.add_argument("--model", default=None, help="Override the model name.")
+    srv.set_defaults(func=cmd_serve)
     return p
 
 

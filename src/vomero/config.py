@@ -46,6 +46,8 @@ class Settings:
     planning_root_only: bool = False
     # Let the model ask the user for help when stuck (auto-disabled off a TTY).
     enable_interaction: bool = True
+    # Let only the root agent reach the human (default: any depth may ask).
+    interaction_root_only: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -63,4 +65,5 @@ class Settings:
             enable_planning=os.getenv("VOMERO_PLAN", "").lower() in ("1", "true", "yes"),
             planning_root_only=os.getenv("VOMERO_PLAN_ROOT_ONLY", "").lower() in ("1", "true", "yes"),
             enable_interaction=os.getenv("VOMERO_INTERACTIVE", "true").lower() in ("1", "true", "yes"),
+            interaction_root_only=os.getenv("VOMERO_ASK_ROOT_ONLY", "").lower() in ("1", "true", "yes"),
         )

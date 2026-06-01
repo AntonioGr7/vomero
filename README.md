@@ -155,6 +155,59 @@ prompter) is safe: `ask_user` returns a "no user available, proceed with best
 judgment" reply instead of hanging. The model is told to ask *sparingly* —
 explore the corpus first, ask only when proceeding would mean guessing.
 
+By default any depth may ask the user; `--ask-root-only` (or
+`VOMERO_ASK_ROOT_ONLY=1`) restricts the human prompt to the root agent.
+
+**Sub-agents consult their parent first.** A recursive `rlm()` sub-agent is
+isolated, so it may lack context the parent had. Before escalating to the human
+it can call `ask_parent(question)` — the engine answers with a one-shot
+completion over the *parent's* live context (which reflects compaction), so the
+delegating agent clarifies intent/scope without involving you. The model is told
+to prefer `ask_parent` for anything about the task's intent, and `ask_user` only
+for things the parent wouldn't know either. With `--ask-root-only`, sub-agents
+lose `ask_user` but keep `ask_parent`.
+
+Since it's model-to-model (no human), `ask_parent` works even headless/piped.
+The exchange is recorded in the **sub-agent's** history (so it remembers the
+clarification on later steps) but never in the **parent's** — the parent answers
+from a copy of its context, preserving the isolation that keeps the root small.
+
+## Frontends (the Channel seam)
+
+The engine doesn't know whether it's talking to a shell, a test, or a browser —
+it depends only on a **`Channel`** ([vomero/channel.py](src/vomero/channel.py)):
+
+```python
+class Channel(Protocol):
+    def emit(self, step: Step) -> None: ...      # progress / usage / plan events
+    def ask_user(self, question: str) -> str: ... # reach the human (may block)
+```
+
+Built-ins: `NullChannel` (drops events, no human — the safe default) and
+`CallbackChannel` (adapts the CLI's printers + terminal prompt). To put the RLM
+behind a browser, implement a `Channel` that serializes each `Step` to JSON and
+pushes it over a WebSocket, and whose `ask_user` blocks on a queue the socket
+fills when the user replies — then run `engine.run(...)` in a worker thread per
+session. No engine changes required.
+
+Token usage is read from a **caller-owned `UsageMeter`** (`engine.run(...,
+meter=m)`), not from engine state — so one engine instance serves concurrent
+runs safely.
+
+A working HTTP/SSE frontend ships in the box — `vomero serve` streams events to
+a browser or any HTTP client and accepts human replies for `ask_user`:
+
+```bash
+vomero serve --data examples/sample_corpus --port 8000
+# then open examples/browser_client.html, or curl the API
+```
+
+See **[docs/serving.md](docs/serving.md)** for the protocol, event types, and
+browser / curl / Python client examples.
+
+> Before exposing this to a browser, swap `InProcessEnvironment` for a sandboxed
+> backend (ADR 0001): the model's code currently runs in-process with `exec`.
+
 ## Roadmap (next)
 
 - Interactive `vomero chat` (multi-turn, persistent REPL across questions).

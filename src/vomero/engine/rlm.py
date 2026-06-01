@@ -22,6 +22,7 @@ from typing import Callable
 from ..context.corpus import Corpus
 from ..env import ExecutionEnvironment, InProcessEnvironment
 from ..llm.base import LLMClient, Message, ToolSpec
+from ..channel import Channel, CallbackChannel
 from ..usage import UsageMeter, UsageSnapshot, estimate_message_tokens
 from .compaction import Compactor, CompactionEvent
 from .todo import TodoItem, TodoList
@@ -104,8 +105,8 @@ exactly one item in progress at a time. You do NOT need to print the list; it is
 shown to the user automatically, so keep it out of your printed output."""
 
 
-# Appended to the system prompt only when interaction is enabled.
-INTERACTION_PROMPT = """
+# Appended to the system prompt when the model may ask the human user.
+ASK_USER_PROMPT = """
 
 You can ask the user for help when you are genuinely stuck:
 
@@ -118,6 +119,21 @@ or you face a consequential decision the data cannot resolve. Explore the corpus
 first — never ask what you could find yourself. Ask one specific, answerable
 question at a time, then capture the reply (e.g. `reply = ask_user(...)`), act on
 it, and reflect it in your final answer."""
+
+# Appended for sub-agents (a delegated task that has a parent to consult).
+ASK_PARENT_PROMPT = """
+
+You are a sub-task delegated by a parent agent that holds the broader goal and
+the original request. When you lack context to proceed — the task is
+underspecified, or you need information the parent likely has — ask it first:
+
+  ask_parent(question) -> str   Ask the delegating agent for clarification;
+                                returns its reply as a string.
+
+Prefer this over asking the user for anything about the task's intent or scope:
+the parent set up this sub-task and can usually answer without involving a human.
+Ask the user only for things the parent also wouldn't know. The exchange is added
+to your context automatically — you don't need to print it."""
 
 
 @dataclass
@@ -133,10 +149,14 @@ class LLMCall:
 
 @dataclass
 class Interaction:
-    """A round-trip where the model asked the user something and got a reply."""
+    """A round-trip where the model asked for help and got a reply.
+
+    `kind` is "user" (asked the human) or "parent" (a sub-agent asked the agent
+    that delegated it)."""
 
     question: str
     answer: str
+    kind: str = "user"
 
 
 @dataclass
@@ -175,6 +195,7 @@ class RLMEngine:
         enable_planning: bool = False,
         planning_root_only: bool = False,
         enable_interaction: bool = False,
+        interaction_root_only: bool = False,
     ):
         self.client = client
         self.env_factory = env_factory
@@ -188,13 +209,14 @@ class RLMEngine:
         self.planning_root_only = planning_root_only
         # When True, inject `ask_user` and tell the model it may ask for help.
         self.enable_interaction = enable_interaction
+        # By default any depth may ask the user. Set True to let only the root
+        # agent reach the human (sub-agents still consult their parent).
+        self.interaction_root_only = interaction_root_only
         # Optional history compaction. None => never compact (small corpora,
         # tests). Shared across the recursion; each loop compacts its own stack.
         self.compactor = compactor
-        # Token accounting for the most recent top-level run. The reference is
-        # stored as soon as the run starts and stays live, so callers can read
-        # final totals off `engine.last_usage` after `run` returns.
-        self.last_usage: UsageMeter | None = None
+        # NOTE: the engine holds no per-run state. Usage is returned via the
+        # caller-owned `meter`, so one engine can serve concurrent runs safely.
 
     def run(
         self,
@@ -202,37 +224,65 @@ class RLMEngine:
         corpus: Corpus,
         *,
         depth: int = 0,
-        on_event: Callable[[Step], None] | None = None,
+        channel: Channel | None = None,
         meter: UsageMeter | None = None,
+        clarify_handler: Callable[[str], str] | None = None,
+        # Per-run planning overrides (None => use the engine defaults). Lets a
+        # shared server engine turn the plan surface on/off per request.
+        enable_planning: bool | None = None,
+        planning_root_only: bool | None = None,
+        # Back-compat conveniences; folded into a CallbackChannel when no
+        # `channel` is given. New frontends should pass a `channel` instead.
+        on_event: Callable[[Step], None] | None = None,
         ask_handler: Callable[[str], str] | None = None,
     ) -> str:
-        # Top-level run owns a fresh meter; recursive sub-calls share it so the
-        # cumulative figure spans the whole tree.
+        # The frontend is a single Channel. Pass your own UsageMeter to read
+        # token usage after the run — the engine keeps no per-run state, so the
+        # same engine instance is safe to use from concurrent threads.
+        if channel is None:
+            channel = CallbackChannel(on_event=on_event, ask_handler=ask_handler)
         meter = meter or UsageMeter()
-        if depth == 0:
-            self.last_usage = meter
+        # Resolve per-run planning against the engine defaults (so recursion and
+        # the server can override without mutating the shared engine).
+        if enable_planning is None:
+            enable_planning = self.enable_planning
+        if planning_root_only is None:
+            planning_root_only = self.planning_root_only
 
         env = self.env_factory()
         holder: dict[str, str] = {}
         # Live step index, so sub-calls made from inside the model's code (which
         # runs mid-step) can tag their events with the step they belong to.
         current: dict[str, int] = {"index": 0}
+        # Messages to splice into THIS agent's history after the current step's
+        # tool results (appending mid-step would split a tool-call/result pair).
+        pending_context: list[Message] = []
 
         def answer(text) -> None:
             holder["value"] = str(text)
 
         def ask_user(question: str) -> str:
             q = str(question)
-            if ask_handler is None:
-                # Headless: don't hang. Tell the model to proceed autonomously.
-                reply = ("No user is available to answer (running "
-                         "non-interactively). Proceed with your best judgment "
-                         "and state any assumptions in your answer.")
-            else:
-                reply = str(ask_handler(q))
-            if on_event:
-                on_event(Step(depth=depth, index=current["index"],
+            # The channel reaches the human (or degrades gracefully headless).
+            reply = channel.ask_user(q)
+            channel.emit(Step(depth=depth, index=current["index"],
                               interaction=Interaction(question=q, answer=reply)))
+            return reply
+
+        def ask_parent(question: str) -> str:
+            # Only injected for sub-agents (clarify_handler is then non-None).
+            # The parent answers from a COPY of its context, so this exchange
+            # never enters the parent's history — only ours, recorded below.
+            q = str(question)
+            reply = str(clarify_handler(q))
+            channel.emit(Step(depth=depth, index=current["index"],
+                              interaction=Interaction(question=q, answer=reply,
+                                                      kind="parent")))
+            pending_context.append(Message(
+                "user",
+                f"[Clarification from the parent agent]\nYour question: {q}\n"
+                f"Parent's answer: {reply}",
+            ))
             return reply
 
         def llm(text: str, system: str | None = None) -> str:
@@ -245,12 +295,11 @@ class RLMEngine:
             # A flat sub-call still spends tokens; fold it into the shared total.
             meter.record(resp.usage, sent_messages=msgs, response_text=resp.content)
             out = resp.content or ""
-            if on_event:
-                on_event(Step(
-                    depth=depth, index=current["index"],
-                    llm_call=LLMCall(prompt=text, response=out,
-                                     tokens=meter.total_tokens - before),
-                ))
+            channel.emit(Step(
+                depth=depth, index=current["index"],
+                llm_call=LLMCall(prompt=text, response=out,
+                                 tokens=meter.total_tokens - before),
+            ))
             return out
 
         def rlm(sub_question: str, paths: list[str] | None = None) -> str:
@@ -259,29 +308,54 @@ class RLMEngine:
                 # make progress instead of failing.
                 return llm(sub_question)
             sub_corpus = corpus.subset(paths) if paths else corpus
+
+            # The sub-agent can call ask_parent(...) to consult us. We're
+            # suspended inside execute() while it runs, so we answer with a
+            # one-shot completion over OUR live context (`messages`, which
+            # reflects compaction) plus the sub-agent's question.
+            def clarify(child_question: str) -> str:
+                ctx = list(messages) + [Message(
+                    "user",
+                    "A sub-task you delegated needs clarification before it can "
+                    f'proceed:\n\n  "{child_question}"\n\nAnswer concisely from '
+                    "what you already know about the overall goal and context. "
+                    "If you don't have the answer either, say so briefly so the "
+                    "sub-task knows to find it or ask the user.",
+                )]
+                resp = self.client.complete(ctx, model=self.model)
+                meter.record(resp.usage, sent_messages=ctx, response_text=resp.content)
+                return resp.content or ""
+
             return self.run(
                 sub_question,
                 sub_corpus,
                 depth=depth + 1,
-                on_event=on_event,
+                channel=channel,
                 meter=meter,
-                ask_handler=ask_handler,
+                clarify_handler=clarify,
+                enable_planning=enable_planning,
+                planning_root_only=planning_root_only,
             )
 
         names = dict(corpus=corpus, llm=llm, rlm=rlm, answer=answer)
         system_prompt = SYSTEM_PROMPT
-        planning_here = self.enable_planning and (not self.planning_root_only or depth == 0)
+        planning_here = enable_planning and (not planning_root_only or depth == 0)
         if planning_here:
             system_prompt += PLANNING_PROMPT
 
             def on_todo_change(items: list[TodoItem]) -> None:
-                if on_event:
-                    on_event(Step(depth=depth, index=current["index"], todo=items))
+                channel.emit(Step(depth=depth, index=current["index"], todo=items))
 
             names["todo"] = TodoList(on_todo_change)
         if self.enable_interaction:
-            system_prompt += INTERACTION_PROMPT
-            names["ask_user"] = ask_user
+            # ask_user reaches the human (root-only optionally); ask_parent lets
+            # a sub-agent consult the agent that delegated it (depth > 0 only).
+            if not self.interaction_root_only or depth == 0:
+                system_prompt += ASK_USER_PROMPT
+                names["ask_user"] = ask_user
+            if clarify_handler is not None:
+                system_prompt += ASK_PARENT_PROMPT
+                names["ask_parent"] = ask_parent
         env.inject(**names)
 
         messages: list[Message] = [
@@ -297,14 +371,13 @@ class RLMEngine:
             context_tokens, context_estimated = meter.record(
                 resp.usage, sent_messages=messages, response_text=resp.content
             )
-            if on_event:
-                on_event(Step(
-                    depth=depth, index=i,
-                    usage=meter.snapshot(context_tokens, context_estimated),
-                ))
-                # Natural-language the model emitted alongside its tool call.
-                if resp.content and resp.tool_calls:
-                    on_event(Step(depth=depth, index=i, message=resp.content))
+            channel.emit(Step(
+                depth=depth, index=i,
+                usage=meter.snapshot(context_tokens, context_estimated),
+            ))
+            # Natural-language the model emitted alongside its tool call.
+            if resp.content and resp.tool_calls:
+                channel.emit(Step(depth=depth, index=i, message=resp.content))
             step_start = len(messages)  # for projecting this step's growth
             messages.append(
                 Message("assistant", content=resp.content, tool_calls=resp.tool_calls)
@@ -313,28 +386,30 @@ class RLMEngine:
             # No tool call => the model is answering directly.
             if not resp.tool_calls:
                 final = resp.content or holder.get("value", "")
-                if on_event:
-                    on_event(Step(depth=depth, index=i, final=final))
+                channel.emit(Step(depth=depth, index=i, final=final))
                 return final
 
             for tc in resp.tool_calls:
                 code = tc.arguments.get("code", "")
-                if on_event:
-                    on_event(Step(depth=depth, index=i, code=code))
+                channel.emit(Step(depth=depth, index=i, code=code))
                 result = env.execute(code)
                 output = result.stdout
                 if result.error:
                     output = (output + "\n" if output else "") + result.error
                 output = output.strip() or "(no output)"
-                if on_event:
-                    on_event(Step(depth=depth, index=i, output=output))
+                channel.emit(Step(depth=depth, index=i, output=output))
                 messages.append(
                     Message("tool", content=output, tool_call_id=tc.id)
                 )
 
+            # Splice in any parent-clarification exchanges now that all tool
+            # results for this step are in place (keeps the pairing intact).
+            if pending_context:
+                messages.extend(pending_context)
+                pending_context.clear()
+
             if "value" in holder:
-                if on_event:
-                    on_event(Step(depth=depth, index=i, final=holder["value"]))
+                channel.emit(Step(depth=depth, index=i, final=holder["value"]))
                 return holder["value"]
 
             # Compaction check. `context_tokens` is the authoritative size of
@@ -358,8 +433,8 @@ class RLMEngine:
                         meter=meter,
                         state_description=env.describe_state(),
                     )
-                    if summarized and on_event:
-                        on_event(Step(
+                    if summarized:
+                        channel.emit(Step(
                             depth=depth,
                             index=i,
                             compaction=CompactionEvent(

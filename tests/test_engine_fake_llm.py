@@ -60,11 +60,9 @@ def test_usage_sums_provider_reported_tokens():
         _py("1", "print(corpus.files())", usage=Usage(prompt_tokens=100, completion_tokens=10)),
         _py("2", "answer('done')", usage=Usage(prompt_tokens=180, completion_tokens=5)),
     ]
-    engine = RLMEngine(FakeClient(script))
-    engine.run("q", Corpus(CORPUS))
+    u = UsageMeter()
+    RLMEngine(FakeClient(script)).run("q", Corpus(CORPUS), meter=u)
 
-    u = engine.last_usage
-    assert u is not None
     assert u.calls == 2
     assert u.estimated is False
     assert u.prompt_tokens == 280
@@ -74,11 +72,9 @@ def test_usage_sums_provider_reported_tokens():
 
 def test_usage_estimates_when_provider_omits_it():
     script = [_py("1", "print(1)"), _py("2", "answer('done')")]
-    engine = RLMEngine(FakeClient(script))
-    engine.run("q", Corpus(CORPUS))
+    u = UsageMeter()
+    RLMEngine(FakeClient(script)).run("q", Corpus(CORPUS), meter=u)
 
-    u = engine.last_usage
-    assert u is not None
     assert u.calls == 2
     assert u.estimated is True
     assert u.total_tokens > 0
@@ -242,8 +238,9 @@ def test_loop_compacts_when_context_crosses_threshold():
     engine = RLMEngine(client, compactor=compactor)
 
     events = []
+    meter = UsageMeter()
     out = engine.run(
-        "q", Corpus(CORPUS),
+        "q", Corpus(CORPUS), meter=meter,
         on_event=lambda s: events.append(s.compaction) if s.compaction else None,
     )
 
@@ -251,7 +248,7 @@ def test_loop_compacts_when_context_crosses_threshold():
     assert client.summarize_calls == 1  # exactly one compaction
     assert len(events) == 1 and events[0].summarized_messages == 2
     # Cumulative accounting includes the 3 tool turns + the summarization call.
-    assert engine.last_usage.calls == 4
+    assert meter.calls == 4
 
 
 def test_trace_surfaces_llm_subcalls_and_final_text():
@@ -306,6 +303,41 @@ def test_planning_surface_emits_todo_events_when_enabled():
     assert [it.status for it in todos[-1]] == ["completed", "completed"]
     # Mid-run there is exactly one in_progress at the right moment.
     assert [it.status for it in todos[1]] == ["in_progress", "pending"]
+
+
+def test_planning_can_be_enabled_per_run():
+    # Engine default OFF, but this run turns it on.
+    script = [_py("1", "todo.plan(['a', 'b']); todo.start(1); answer('done')")]
+    steps = []
+    RLMEngine(FakeClient(script)).run(
+        "q", Corpus(CORPUS), on_event=steps.append, enable_planning=True
+    )
+    assert any(s.todo is not None for s in steps)
+
+
+def test_planning_per_run_can_override_engine_default_off():
+    # Engine default ON, but this run turns it off -> `todo` not injected.
+    script = [_py("1", "todo.plan(['a'])"), _py("2", "answer('done')")]
+    steps = []
+    RLMEngine(FakeClient(script), enable_planning=True).run(
+        "q", Corpus(CORPUS), on_event=steps.append, enable_planning=False
+    )
+    assert all(s.todo is None for s in steps)
+    assert any("NameError" in o for o in (s.output for s in steps if s.output))
+
+
+def test_per_run_planning_propagates_to_sub_agents():
+    client = FakeClient([
+        _py("r1", "print(rlm('subq'))"),
+        _py("s1", "todo.plan(['sub step']); print('ok')"),
+        _py("s2", "answer('sub done')"),
+        _py("r2", "answer('root done')"),
+    ])
+    steps = []
+    RLMEngine(client).run(  # engine default OFF; per-run ON must reach depth 1
+        "q", Corpus(CORPUS), on_event=steps.append, enable_planning=True
+    )
+    assert any(s.todo is not None and s.depth == 1 for s in steps)
 
 
 def test_todo_surface_absent_unless_enabled():
@@ -394,6 +426,141 @@ def test_ask_user_absent_unless_enabled():
     outputs = [s.output for s in steps if s.output]
     assert any("NameError" in o for o in outputs)
     assert all(s.interaction is None for s in steps)
+
+
+def _say(content):
+    return LLMResponse(content=content, tool_calls=[])
+
+
+# --- channel seam / concurrency-safety --------------------------------------
+
+def test_custom_channel_receives_events_and_answers_ask_user():
+    class MyChannel:
+        def __init__(self):
+            self.steps = []
+            self.asked = []
+
+        def emit(self, step):
+            self.steps.append(step)
+
+        def ask_user(self, question):
+            self.asked.append(question)
+            return "blue"
+
+    ch = MyChannel()
+    script = [_py("1", "c = ask_user('color?'); print(c)"), _py("2", "answer('picked ' + c)")]
+    out = RLMEngine(FakeClient(script), enable_interaction=True).run(
+        "q", Corpus(CORPUS), channel=ch
+    )
+
+    assert out == "picked blue"
+    assert ch.asked == ["color?"]
+    assert any(s.interaction and s.interaction.answer == "blue" for s in ch.steps)
+    assert any(s.code is not None for s in ch.steps)  # progress events flowed too
+
+
+def test_engine_holds_no_per_run_state():
+    # Usage lives with the caller's meter, not on the engine — so one engine
+    # instance is safe across concurrent runs.
+    eng = RLMEngine(FakeClient([_py("1", "answer('x')")]))
+    m = UsageMeter()
+    eng.run("q", Corpus(CORPUS), meter=m)
+    assert m.calls == 1
+    assert not hasattr(eng, "last_usage")
+
+
+def test_sub_agent_can_ask_parent_for_clarification():
+    # Across the tree the complete() order is: root#1, sub#1, clarify, sub#2, root#2.
+    script = [
+        _py("r1", "print(rlm('format the report'))"),      # root delegates
+        _py("s1", "fmt = ask_parent('what output format?'); print('FMT=' + fmt)"),
+        _say("Markdown with a summary table."),              # parent's clarification
+        _py("s2", "answer('sub formatted as ' + fmt)"),      # sub uses the answer
+        _py("r2", "answer('root done')"),
+    ]
+    steps = []
+    RLMEngine(FakeClient(script), enable_interaction=True).run(
+        "q", Corpus(CORPUS), on_event=steps.append
+    )
+
+    parent_qs = [s.interaction for s in steps if s.interaction and s.interaction.kind == "parent"]
+    assert len(parent_qs) == 1
+    assert parent_qs[0].question == "what output format?"
+    assert parent_qs[0].answer == "Markdown with a summary table."
+    # The clarification was incorporated by the sub-agent and surfaced back to root.
+    root_outputs = [s.output for s in steps if s.output and s.depth == 0]
+    assert any("Markdown with a summary table." in o for o in root_outputs)
+
+
+def test_parent_clarification_recorded_in_sub_history_not_root():
+    class RecordingClient:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.i = 0
+            self.calls = []  # one entry per complete(): {tools, question, blob}
+
+        def complete(self, messages, *, tools=None, model=None, temperature=None):
+            self.calls.append({
+                "tools": bool(tools),
+                "question": messages[1].content if len(messages) > 1 else None,
+                "blob": "\n".join(m.content or "" for m in messages),
+            })
+            r = self.responses[self.i]
+            self.i += 1
+            return r
+
+    client = RecordingClient([
+        _py("r1", "print(rlm('format the report'))"),
+        _py("s1", "fmt = ask_parent('what output format?')"),
+        _say("Markdown with a summary table."),
+        _py("s2", "answer('sub formatted as ' + fmt)"),
+        _py("r2", "answer('root done')"),
+    ])
+    RLMEngine(client, enable_interaction=True).run("q", Corpus(CORPUS))
+
+    MARK = "[Clarification from the parent agent]"
+    # The sub-agent's own loop calls (tools=True, its sub-question) carry it...
+    sub_loop = [c for c in client.calls if c["tools"] and c["question"] == "format the report"]
+    assert any(MARK in c["blob"] for c in sub_loop)
+    # ...but the root's persistent loop calls (tools=True, original question) never do.
+    root_loop = [c for c in client.calls if c["tools"] and c["question"] == "q"]
+    assert root_loop and all(MARK not in c["blob"] for c in root_loop)
+
+
+def test_ask_parent_absent_at_root():
+    script = [_py("1", "ask_parent('x')"), _py("2", "answer('ok')")]
+    steps = []
+    RLMEngine(FakeClient(script), enable_interaction=True).run(
+        "q", Corpus(CORPUS), on_event=steps.append
+    )
+    outputs = [s.output for s in steps if s.output]
+    assert any("NameError" in o for o in outputs)  # no parent to consult at the root
+
+
+def test_interaction_root_only_scopes_ask_user_but_keeps_ask_parent():
+    def make():
+        return FakeClient([
+            _py("r1", "print(rlm('subq'))"),
+            _py("s1", "ask_user('hi')"),       # sub tries to reach the human
+            _py("s2", "answer('sub done')"),
+            _py("r2", "answer('root done')"),
+        ])
+
+    # Default — a sub-agent may ask the user directly.
+    steps = []
+    RLMEngine(make(), enable_interaction=True).run(
+        "q", Corpus(CORPUS), on_event=steps.append, ask_handler=lambda q: "yo"
+    )
+    assert any(s.interaction and s.interaction.kind == "user" and s.depth == 1 for s in steps)
+
+    # root-only — the sub-agent has no ask_user (NameError), but ask_parent stays available.
+    steps = []
+    RLMEngine(make(), enable_interaction=True, interaction_root_only=True).run(
+        "q", Corpus(CORPUS), on_event=steps.append, ask_handler=lambda q: "yo"
+    )
+    assert not any(s.interaction and s.interaction.kind == "user" and s.depth == 1 for s in steps)
+    sub_outputs = [s.output for s in steps if s.output and s.depth == 1]
+    assert any("NameError" in o for o in sub_outputs)
 
 
 def test_todo_bad_index_raises_clear_error():
