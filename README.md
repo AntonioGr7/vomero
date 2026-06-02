@@ -309,6 +309,13 @@ vomero serve --data examples/sample_corpus --port 8000
 See **[docs/serving.md](docs/serving.md)** for the protocol, event types, and
 browser / curl / Python client examples.
 
+## Deploying it as a service
+
+Embedding Vomero in your own backend (FastAPI, a custom socket server), the full
+environment/configuration reference, multi-turn sessions, and — importantly —
+how to run it **safely** as a microservice (including on Kubernetes): see
+**[docs/deployment.md](docs/deployment.md)**.
+
 > Before exposing this to a browser on untrusted input, turn on the gVisor
 > sandbox (`VOMERO_SANDBOX=1`, [ADR 0004](docs/adr/0004-gvisor-sandbox.md)): by
 > default the model's code runs in-process with `exec`.
