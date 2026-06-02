@@ -1,0 +1,16 @@
+# ⚠ FALLBACK ONLY — goes with deployment.yaml (in-cluster Strategy B). For the
+# chosen VM setup (Strategy A), use vomero-endpoint.yaml instead, which points
+# at the external VM. This Service selects in-cluster Vomero pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vomero
+spec:
+  selector: { app: vomero }
+  ports:
+    - port: 80
+      targetPort: 8000
+  # sessionAffinity keeps a client pinned to one pod by source IP — a cheap way
+  # to keep a conversation's history/variables on the same replica when you
+  # scale to >1. For real routing, key affinity on session_id at the Ingress.
+  sessionAffinity: ClientIP

@@ -1,0 +1,24 @@
+# Frontend egress policy: with Strategy A, Vomero runs on the VM, so the thing
+# to constrain in-cluster is YOUR FRONTEND — it should only be able to reach the
+# Vomero VM (and DNS). Adjust `app: frontend` to your frontend's labels and the
+# VM IP to match vomero-endpoint.yaml.
+#
+# NOTE: NetworkPolicy only takes effect if your cluster's CNI enforces it
+# (Calico, Cilium, GKE Dataplane V2, ...). Otherwise it's silently ignored.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-to-vomero
+spec:
+  podSelector:
+    matchLabels: { app: frontend }     # <-- your frontend pods
+  policyTypes: ["Egress"]
+  egress:
+    - to: []                           # DNS resolution
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:                              # the Vomero VM only
+        - ipBlock: { cidr: 10.0.0.5/32 }   # <-- the VM's private IP
+      ports:
+        - { protocol: TCP, port: 8000 }

@@ -1,0 +1,25 @@
+# systemd unit for the Vomero service on the VM.
+# Install:  sudo cp deploy/vm/vomero.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now vomero
+[Unit]
+Description=Vomero (RLM) HTTP service
+After=docker.service
+Requires=docker.service
+
+[Service]
+# A dedicated user that is in the `docker` group (it must be able to run
+# `docker run`). On a dedicated VM this is acceptable; docker-group ≈ root.
+User=vomero
+Group=docker
+WorkingDirectory=/opt/vomero
+EnvironmentFile=/etc/vomero/vomero.env
+# app.py lives in deploy/; --app-dir puts it on the import path.
+ExecStart=/opt/vomero/.venv/bin/uvicorn app:app --app-dir deploy --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=3
+# Let in-flight runs finish and the session pool tear down its sandboxes cleanly
+# (uvicorn turns SIGTERM into a graceful shutdown -> app's shutdown hook).
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

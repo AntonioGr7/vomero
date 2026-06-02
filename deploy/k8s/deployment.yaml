@@ -1,0 +1,72 @@
+# ⚠ FALLBACK ONLY — Strategy B (in-cluster, in-process). NOT the chosen setup.
+# For untrusted/user-selected data, use Strategy A on a VM instead (deploy/vm/).
+# Here the model's code runs in-process inside this pod, so it can read this
+# pod's env (your API key). Only use this if your data is actually trusted, and
+# keep the egress NetworkPolicy + a scoped key. Replace `image:` then apply.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vomero
+  labels: { app: vomero }
+spec:
+  replicas: 1                       # see docs/deployment.md §8 before scaling >1
+  selector:
+    matchLabels: { app: vomero }
+  template:
+    metadata:
+      labels: { app: vomero }
+    spec:
+      runtimeClassName: gvisor      # <-- THE sandbox. Remove only if you accept no isolation.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: vomero
+          image: REPLACE_ME/vomero-service:latest
+          args: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - containerPort: 8000
+          env:
+            - { name: VOMERO_PROVIDER, value: "openai" }
+            - { name: VOMERO_MODEL, value: "gpt-4o-mini" }
+            - { name: VOMERO_DATA_ROOT, value: "/data" }          # INPUT: the selected datasets (read-only)
+            - { name: VOMERO_WORKSPACE_ROOT, value: "/workspace" } # OUTPUT: where the model writes result files
+            - { name: VOMERO_SESSION_TTL, value: "900" }          # idle seconds before a session's variables are dropped
+            - { name: VOMERO_MAX_STEPS, value: "16" }   # cost ceiling per question
+            - { name: VOMERO_MAX_DEPTH, value: "2" }
+          envFrom:
+            - secretRef: { name: vomero-llm }           # injects OPENAI_API_KEY etc.
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits:   { cpu: "2",    memory: "2Gi" }     # hard caps
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true                 # rootfs read-only; the mounts below are the writable spots
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: data, mountPath: /data, readOnly: true }    # INPUT datasets — read-only (model only reads them)
+            - { name: workspace, mountPath: /workspace }          # OUTPUT — model's result files land here (writable)
+            - { name: tmp, mountPath: /tmp }                      # scratch
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 10
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        # INPUT: the dataset store your platform pre-populates, mounted read-only.
+        # VOMERO_DATA_ROOT points here; each request's `dataset` is a subfolder.
+        # The model reads it but never writes it (in the gVisor sandbox it is
+        # ALWAYS mounted read-only, so source data can't be tampered with).
+        - name: data
+          persistentVolumeClaim: { claimName: vomero-datasets, readOnly: true }
+        # OUTPUT: where files the model PRODUCES go (per-session subfolders under
+        # VOMERO_WORKSPACE_ROOT). Use a PVC so results survive a pod restart and
+        # your UI can collect them; an emptyDir instead makes them ephemeral.
+        - name: workspace
+          persistentVolumeClaim: { claimName: vomero-workspace }   # ReadWriteOnce/Many, writable

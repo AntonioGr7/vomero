@@ -1,0 +1,14 @@
+# The gVisor RuntimeClass. This is what makes the pod a kernel-level sandbox.
+#
+# You usually do NOT create this by hand:
+#   * GKE: enable "GKE Sandbox" on a node pool and the `gvisor` RuntimeClass is
+#     created for you — skip this file.
+#   * Self-managed nodes: install gVisor + the containerd shim on the nodes
+#     (https://gvisor.dev/docs/user_guide/install/), THEN apply this file.
+#
+# `handler: runsc` must match the handler your nodes registered.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
