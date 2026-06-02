@@ -35,6 +35,22 @@ class SandboxConfig:
     pids_limit: int = 256         # max processes/threads — fork-bomb guard
     tmpfs_size: str = "64m"       # size of the writable /tmp tmpfs
 
+    # gVisor blocks access to host Unix-domain sockets by default
+    # (--host-uds=none), which would refuse the agent's connection to our
+    # bind-mounted control socket. "open" permits connecting to existing host
+    # sockets (our /sock control channel) without allowing it to bind new ones;
+    # passed per-container via the `dev.gvisor.flag.host-uds` OCI annotation, so
+    # no daemon-level runsc config is required. Only applied for the gVisor
+    # runtime. Set to "" to disable emitting the annotation.
+    host_uds: str = "open"
+
+    # Durable, writable workspace. A host directory bind-mounted read-WRITE at
+    # /workspace and used as the container's working dir, so files the model
+    # creates land there and SURVIVE container teardown (unlike the ephemeral
+    # /tmp tmpfs). Point a session's own directory here (see SessionEnvPool) to
+    # let files persist across turns. None => no workspace; cwd stays /tmp.
+    workspace: str | None = None
+
     # --- isolation ---
     network: str = "none"         # Docker --network; "none" = no network at all
     # Container user. None => the host's uid:gid, so the read-only corpus mount

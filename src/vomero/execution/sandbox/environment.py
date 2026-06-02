@@ -53,6 +53,7 @@ _CONTAINER_AGENT_DIR = "/opt/vomero-agent"
 _CONTAINER_CORPUS_SRC = "/opt/vomero_corpus_src.py"
 _CONTAINER_SOCK_DIR = "/sock"
 _SOCK_NAME = "vomero.sock"
+_CONTAINER_WORKSPACE = "/workspace"
 
 
 class SandboxEnvironment(ExecutionEnvironment):
@@ -78,25 +79,37 @@ class SandboxEnvironment(ExecutionEnvironment):
     def inject(self, **names: Any) -> None:
         """Register the host surface. Callables become RPC stubs in the sandbox;
         the corpus is bind-mounted; objects with methods (e.g. `todo`) are
-        method-proxied; anything JSON-serializable is sent as plain data."""
+        method-proxied; anything JSON-serializable is sent as plain data.
+
+        Reuse-safe: calling inject() again on an already-started container (the
+        warm-session path) does NOT restart it. The corpus mount, any plain data
+        and the model's REPL variables were fixed when it started and stay put;
+        only the host-side callables are rebound. That works because the agent's
+        RPC stubs resolve by NAME at call time, so the warm container transparently
+        picks up this run's fresh closures (new channel/meter/answer-holder).
+        The set of injected names must stay stable across a session (it does for
+        a fixed engine); a brand-new name has no stub in the warm namespace."""
+        functions: dict[str, Callable[..., Any]] = {}
+        objects: dict[str, dict[str, Callable[..., Any]]] = {}
         for name, value in names.items():
             if name == "corpus":
-                self._corpus = value
+                if not self._started:
+                    self._corpus = value
             elif callable(value):
-                self._functions[name] = value
+                functions[name] = value
             elif _is_jsonable(value):
-                self._data[name] = value
+                if not self._started:
+                    self._data[name] = value
             else:
-                self._objects[name] = {
+                objects[name] = {
                     attr: getattr(value, attr)
                     for attr in dir(value)
                     if not attr.startswith("_") and callable(getattr(value, attr))
                 }
-        # If we're already running, the namespace was built at startup; a later
-        # inject can't re-mount the corpus. In practice the engine injects once
-        # before the loop, so this is fine — but be explicit about it.
-        if self._started:
-            raise RuntimeError("inject() after the sandbox has started is unsupported")
+        # Callables/objects are always (re)bound; corpus + plain data only matter
+        # before start (they're baked into the container at the init handshake).
+        self._functions.update(functions)
+        self._objects.update(objects)
 
     def execute(self, code: str) -> ExecResult:
         self._ensure_started()
@@ -266,9 +279,26 @@ class SandboxEnvironment(ExecutionEnvironment):
         user = cfg.user
         if user is None and hasattr(os, "getuid"):
             user = f"{os.getuid()}:{os.getgid()}"
+        # gVisor refuses host Unix-socket connections by default; enable just
+        # "open" (connect to existing) so the agent can reach our bind-mounted
+        # control socket. Per-container annotation -> no daemon.json change.
+        uds_annotation = (
+            ["--annotation", f"dev.gvisor.flag.host-uds={cfg.host_uds}"]
+            if cfg.runtime == "runsc" and cfg.host_uds
+            else []
+        )
+        # A durable workspace (if configured) is mounted read-write and becomes
+        # the working dir, so the model's files persist past teardown; otherwise
+        # the cwd is the ephemeral /tmp tmpfs.
+        workspace_mount = (
+            ["-v", f"{cfg.workspace}:{_CONTAINER_WORKSPACE}:rw"]
+            if cfg.workspace else []
+        )
+        workdir = _CONTAINER_WORKSPACE if cfg.workspace else "/tmp"
         cmd = [
             cfg.docker_path, "run", "--rm", "-i",
             "--runtime", cfg.runtime,
+            *uds_annotation,
             "--network", cfg.network,
             *(["--user", user] if user else []),
             "--memory", cfg.memory,
@@ -279,7 +309,8 @@ class SandboxEnvironment(ExecutionEnvironment):
             "--security-opt", "no-new-privileges",
             "--read-only",                       # immutable rootfs...
             "--tmpfs", f"/tmp:rw,size={cfg.tmpfs_size}",  # ...except a small /tmp
-            "-w", "/tmp",
+            *workspace_mount,
+            "-w", workdir,
             "-v", f"{corpus_root}:{_CONTAINER_CORPUS}:ro",
             "-v", f"{agent_dir}:{_CONTAINER_AGENT_DIR}:ro",
             "-v", f"{corpus_src}:{_CONTAINER_CORPUS_SRC}:ro",

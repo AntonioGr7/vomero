@@ -103,6 +103,58 @@ def test_server_streams_todo_events_only_when_plan_requested():
         shutdown()
 
 
+def test_server_resumes_conversation_for_follow_up():
+    """Reusing {user_id, session_id} on a second POST /runs replays the first
+    run's transcript into the engine, so the follow-up has prior context."""
+    captured: dict = {}
+
+    class RecordingClient(FakeClient):
+        def complete(self, messages, *, tools=None, model=None, temperature=None):
+            # Record the context handed to the FIRST call of the second run.
+            if self.calls == 1:
+                captured["context"] = list(messages)
+            return super().complete(messages, tools=tools, model=model)
+
+    # Turn 1 answers; turn 2 (same client/engine, since calls continue) answers
+    # the follow-up. Four scripted responses span both runs.
+    engine = RLMEngine(RecordingClient([
+        _py("1", "answer('P-BEACON is blocked by P-ATLAS')"),  # turn 1
+        LLMResponse(content="P-ATLAS owns it.", tool_calls=[]),  # turn 2, 1st call
+    ]))
+    base, shutdown = _run_server(engine)
+    try:
+        # Turn 1: new conversation (no session_id supplied).
+        started = _post(f"{base}/runs", {"question": "What blocks P-BEACON?",
+                                         "user_id": "u1"})
+        sid = started["session_id"]
+        finals = []
+        _read_sse(f"{base}{started['events']}",
+                  lambda t, d: finals.append((t, d)))
+
+        # Turn 2: SAME user_id + session_id => follow-up with history.
+        started2 = _post(f"{base}/runs", {"question": "Who owns it?",
+                                          "user_id": "u1", "session_id": sid})
+        assert started2["session_id"] == sid          # same conversation
+        types2 = []
+        _read_sse(f"{base}{started2['events']}",
+                  lambda t, d: types2.append((t, d)))
+
+        ctx = captured["context"]
+        contents = [m.content for m in ctx]
+        blob = "\n".join(
+            (m.content or "") + "".join(tc.arguments.get("code", "") for tc in m.tool_calls)
+            for m in ctx
+        )
+        assert ctx[0].role == "system"
+        assert "What blocks P-BEACON?" in contents    # prior question replayed
+        assert "P-ATLAS" in blob                      # prior answer replayed
+        assert contents[-1] == "Who owns it?"         # new question last
+        final2 = next(d["final"] for t, d in types2 if t == "final")
+        assert final2 == "P-ATLAS owns it."
+    finally:
+        shutdown()
+
+
 def test_server_streams_events_and_round_trips_ask_user():
     # Step 2 asks the user; step 3 uses the reply in the final answer.
     script = [

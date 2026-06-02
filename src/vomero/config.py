@@ -45,6 +45,15 @@ class Settings:
     sandbox_pids_limit: int = 256       # fork-bomb guard
     sandbox_startup_timeout: float = 60.0
 
+    # Per-session persistence (server). When a request carries {user_id,
+    # session_id}, its execution environment is kept alive so a follow-up
+    # resumes the model's REPL variables; idle sessions are reclaimed after
+    # `session_ttl` seconds. `workspace_root`, if set, gives each session a
+    # durable directory (mounted read-write in the sandbox) whose files survive
+    # even after the variables are reclaimed. None => no warm reuse / workspace.
+    workspace_root: str | None = None
+    session_ttl: float = 900.0          # 15 min idle before variables are dropped
+
     # Context / compaction. When the live context size crosses
     # `compact_ratio * context_window`, the middle of the transcript is
     # summarized. `compact_ratio <= 0` disables compaction.
@@ -91,6 +100,8 @@ class Settings:
             sandbox_startup_timeout=float(
                 os.getenv("VOMERO_SANDBOX_STARTUP_TIMEOUT", "60")
             ),
+            workspace_root=os.getenv("VOMERO_WORKSPACE_ROOT") or None,
+            session_ttl=float(os.getenv("VOMERO_SESSION_TTL", "900")),
             context_window=int(os.getenv("VOMERO_CONTEXT_WINDOW", "128000")),
             compact_ratio=float(os.getenv("VOMERO_COMPACT_RATIO", "0.8")),
             compact_keep_recent=int(os.getenv("VOMERO_COMPACT_KEEP_RECENT", "6")),

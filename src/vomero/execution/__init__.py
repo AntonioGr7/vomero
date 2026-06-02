@@ -15,12 +15,15 @@ from typing import Any, Callable
 
 from .base import ExecResult, ExecutionEnvironment
 from .inprocess import InProcessEnvironment
+from .session import SessionEnvPool, build_session_pool
 
 __all__ = [
     "ExecResult",
     "ExecutionEnvironment",
     "InProcessEnvironment",
+    "SessionEnvPool",
     "build_env_factory",
+    "build_session_pool",
 ]
 
 

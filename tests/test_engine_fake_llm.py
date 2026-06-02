@@ -55,6 +55,47 @@ def test_plain_text_reply_is_final():
     assert out == "42"
 
 
+def test_history_seed_carries_a_follow_up():
+    """A second run seeded with the first run's transcript sees the prior turn,
+    and the persisted transcript excludes the rebuilt system prompt."""
+    # Turn 1: answer and capture the resumable transcript.
+    turn1 = [_py("1", "answer('P-BEACON is blocked by P-ATLAS')")]
+    engine = RLMEngine(FakeClient(turn1))
+    transcript: list[Message] = []
+    engine.run("What blocks P-BEACON?", Corpus(CORPUS), transcript_sink=transcript)
+
+    # Sink holds the conversation turns but NOT the system prompt.
+    assert transcript and transcript[0].role == "user"
+    assert all(m.role != "system" for m in transcript)
+    assert transcript[0].content == "What blocks P-BEACON?"
+
+    # Turn 2: a client that records the context it is handed on its first call.
+    class RecordingClient(FakeClient):
+        def complete(self, messages, *, tools=None, model=None, temperature=None):
+            if self.calls == 0:
+                self.first_context = list(messages)
+            return super().complete(messages, tools=tools, model=model)
+
+    client = RecordingClient([LLMResponse(content="It is P-ATLAS.", tool_calls=[])])
+    engine2 = RLMEngine(client)
+    out = engine2.run("And who owns it?", Corpus(CORPUS), history=transcript)
+
+    roles = [m.role for m in client.first_context]
+    contents = [m.content for m in client.first_context]
+    # The prior answer arrived via answer(...), so it lives in the assistant
+    # message's tool-call code rather than in .content — fold both into the
+    # haystack we search.
+    blob = "\n".join(
+        (m.content or "") + "".join(tc.arguments.get("code", "") for tc in m.tool_calls)
+        for m in client.first_context
+    )
+    assert roles[0] == "system"                          # system rebuilt, once
+    assert "What blocks P-BEACON?" in contents           # prior question replayed
+    assert "P-ATLAS" in blob                             # prior answer replayed
+    assert contents[-1] == "And who owns it?"            # new question last
+    assert out == "It is P-ATLAS."
+
+
 def test_usage_sums_provider_reported_tokens():
     script = [
         _py("1", "print(corpus.files())", usage=Usage(prompt_tokens=100, completion_tokens=10)),

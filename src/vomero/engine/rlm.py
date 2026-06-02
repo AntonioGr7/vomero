@@ -231,6 +231,22 @@ class RLMEngine:
         # shared server engine turn the plan surface on/off per request.
         enable_planning: bool | None = None,
         planning_root_only: bool | None = None,
+        # Conversation continuity (root-level; not used by recursion). `history`
+        # seeds this run's transcript with prior turns so a follow-up question
+        # builds on them. `transcript_sink`, if given, is cleared and filled with
+        # the resumable transcript (every message except the rebuilt system
+        # prompt) at the end of the run — pass last run's sink as the next run's
+        # `history` to chain turns. The engine still keeps no state of its own;
+        # the caller owns the store. See ADR 0004 / server.py.
+        history: list[Message] | None = None,
+        transcript_sink: list[Message] | None = None,
+        # Persistent execution environment (root-level; recursion always gets a
+        # fresh one via env_factory). Pass a reused env to keep the model's REPL
+        # variables AND its workspace files across turns of the same session —
+        # `inject()` rebinds this run's helper closures onto the warm namespace.
+        # None => a fresh env from env_factory, the stateless default. The caller
+        # owns the env's lifetime (see SessionEnvPool).
+        env: ExecutionEnvironment | None = None,
         # Back-compat conveniences; folded into a CallbackChannel when no
         # `channel` is given. New frontends should pass a `channel` instead.
         on_event: Callable[[Step], None] | None = None,
@@ -249,7 +265,9 @@ class RLMEngine:
         if planning_root_only is None:
             planning_root_only = self.planning_root_only
 
-        env = self.env_factory()
+        # A caller-supplied `env` (root only) is reused across turns to keep the
+        # model's variables/workspace; otherwise build a fresh, stateless one.
+        env = env if env is not None else self.env_factory()
         holder: dict[str, str] = {}
         # Live step index, so sub-calls made from inside the model's code (which
         # runs mid-step) can tag their events with the step they belong to.
@@ -358,10 +376,21 @@ class RLMEngine:
                 names["ask_parent"] = ask_parent
         env.inject(**names)
 
-        messages: list[Message] = [
-            Message("system", system_prompt),
-            Message("user", question),
-        ]
+        # The system prompt is rebuilt every run (it depends on the planning /
+        # interaction flags), so prior turns are spliced in AFTER it, never the
+        # old system message. Each persisted turn keeps its tool-call/result
+        # pairing intact, so the seeded transcript is a valid continuation.
+        messages: list[Message] = [Message("system", system_prompt)]
+        if history:
+            messages.extend(history)
+        messages.append(Message("user", question))
+
+        def _save_transcript() -> None:
+            # Resumable transcript = everything except the rebuilt system prompt.
+            # `messages` may have been rebound by compaction; read it live.
+            if transcript_sink is not None:
+                transcript_sink.clear()
+                transcript_sink.extend(messages[1:])
 
         for i in range(self.max_steps):
             current["index"] = i
@@ -387,6 +416,7 @@ class RLMEngine:
             if not resp.tool_calls:
                 final = resp.content or holder.get("value", "")
                 channel.emit(Step(depth=depth, index=i, final=final))
+                _save_transcript()
                 return final
 
             for tc in resp.tool_calls:
@@ -410,6 +440,7 @@ class RLMEngine:
 
             if "value" in holder:
                 channel.emit(Step(depth=depth, index=i, final=holder["value"]))
+                _save_transcript()
                 return holder["value"]
 
             # Compaction check. `context_tokens` is the authoritative size of
@@ -447,4 +478,5 @@ class RLMEngine:
                         ))
 
         # Ran out of steps — return whatever we have.
+        _save_transcript()
         return holder.get("value") or "Stopped: reached max steps without a final answer."

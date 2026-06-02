@@ -10,9 +10,15 @@ It implements the `Channel` seam over the wire:
 
 Endpoints (the server is bound to ONE corpus, chosen at startup):
 
-  POST /runs                 {"question": "..."}  -> {"session_id", "events", "reply"}
+  POST /runs                 {"question", "user_id"?, "session_id"?}
+                                                  -> {"session_id", "events", "reply"}
   GET  /runs/<id>/events     text/event-stream    -> the live event stream
   POST /runs/<id>/reply      {"answer": "..."}    -> fulfills the current ask_user
+
+To ask a follow-up that builds on a previous run, send the SAME {user_id,
+session_id} again: the server replays that conversation's transcript as context.
+Omit session_id to begin a new conversation (the id is returned in the response
+and in the `done` event).
 
 Concurrency: the engine holds no per-run state, so one engine instance serves
 all sessions. Each run executes in its own daemon thread with its own Channel,
@@ -38,7 +44,8 @@ from .config import Settings
 from .context.corpus import Corpus
 from .engine import Compactor, RLMEngine
 from .engine.rlm import Step
-from .execution import build_env_factory
+from .llm.base import Message
+from .execution import SessionEnvPool, build_env_factory, build_session_pool
 from .llm import build_client
 from .usage import UsageMeter
 
@@ -86,21 +93,46 @@ class Session:
 
 
 class RunManager:
-    """Owns the shared engine + corpus and tracks live sessions."""
+    """Owns the shared engine + corpus and tracks live sessions.
 
-    def __init__(self, corpus: Corpus, engine: RLMEngine):
+    Three stores, deliberately separate and keyed differently:
+      * `_sessions` — live runs, keyed by run id, for SSE/reply routing. A
+        session is dropped when its event stream ends.
+      * `_history` — conversation transcripts, keyed by (user_id, session_id),
+        so a follow-up replays the prior turns. OUTLIVES the live session.
+      * `_pool` — persistent execution environments, keyed by (user_id,
+        session_id), so a follow-up resumes the model's REPL variables and
+        workspace files. Idle envs are reclaimed after the configured TTL.
+
+    Together: `_history` restores the conversation, `_pool` restores the live
+    state. Both are in-process here; back them with SQLite/Redis + a durable
+    workspace volume for restart survival.
+    """
+
+    def __init__(self, corpus: Corpus, engine: RLMEngine,
+                 pool: SessionEnvPool | None = None):
         self.corpus = corpus
         self.engine = engine
+        self._pool = pool
         self._sessions: dict[str, Session] = {}
+        self._history: dict[tuple[str, str], list[Message]] = {}
         self._lock = threading.Lock()
 
-    def start(self, question: str, *, enable_planning: bool | None = None,
+    def start(self, question: str, *, user_id: str = "anonymous",
+              session_id: str | None = None,
+              enable_planning: bool | None = None,
               planning_root_only: bool | None = None) -> Session:
-        session = Session(uuid.uuid4().hex)
+        # A new conversation gets a fresh session_id; passing back a known
+        # (user_id, session_id) continues that conversation.
+        session_id = session_id or uuid.uuid4().hex
+        key = (user_id, session_id)
         with self._lock:
-            self._sessions[session.id] = session
+            # Seed with a copy of the stored transcript (None on first turn).
+            history = list(self._history.get(key, []))
+            session = Session(session_id)
+            self._sessions[session_id] = session
         threading.Thread(
-            target=self._run, args=(session, question),
+            target=self._run, args=(session, question, key, history),
             kwargs={"enable_planning": enable_planning,
                     "planning_root_only": planning_root_only},
             daemon=True,
@@ -112,24 +144,45 @@ class RunManager:
             return self._sessions.get(sid)
 
     def _drop(self, sid: str) -> None:
+        # Only the live-run handle is dropped; the conversation transcript in
+        # `_history` is kept so the next turn can resume it.
         with self._lock:
             self._sessions.pop(sid, None)
 
-    def _run(self, session: Session, question: str, *,
+    def _run(self, session: Session, question: str,
+             key: tuple[str, str], history: list[Message], *,
              enable_planning: bool | None = None,
              planning_root_only: bool | None = None) -> None:
         channel = SSEChannel(session.events, session.replies)
         meter = UsageMeter()
+        transcript: list[Message] = []
         try:
-            # The engine emits the final answer as a `final` Step via the
-            # channel; we add a `done` event carrying the usage summary.
-            self.engine.run(
-                question, self.corpus, channel=channel, meter=meter,
-                enable_planning=enable_planning,
-                planning_root_only=planning_root_only,
-            )
+            # A pooled, persistent env (when configured) keeps this session's
+            # variables/workspace across turns; its lock serializes same-session
+            # runs. Without a pool, the engine builds a fresh env per run.
+            if self._pool is not None:
+                with self._pool.session(key) as env:
+                    self.engine.run(
+                        question, self.corpus, channel=channel, meter=meter,
+                        enable_planning=enable_planning,
+                        planning_root_only=planning_root_only,
+                        history=history, transcript_sink=transcript, env=env,
+                    )
+            else:
+                self.engine.run(
+                    question, self.corpus, channel=channel, meter=meter,
+                    enable_planning=enable_planning,
+                    planning_root_only=planning_root_only,
+                    history=history, transcript_sink=transcript,
+                )
+            # Persist the resumable transcript only on success (the sink is
+            # filled at the engine's normal exit points, empty on error, so a
+            # failed run leaves the prior history intact).
+            with self._lock:
+                self._history[key] = transcript
             session.events.put({
                 "type": "done",
+                "session_id": key[1],
                 "usage": {
                     "calls": meter.calls,
                     "total_tokens": meter.total_tokens,
@@ -191,8 +244,14 @@ class _Handler(BaseHTTPRequestHandler):
             # Optional per-request planning (else the server/engine default).
             plan = bool(body["plan"]) if "plan" in body else None
             plan_root = bool(body["plan_root_only"]) if "plan_root_only" in body else None
+            # Conversation continuity: pass back a prior {user_id, session_id}
+            # to ask a follow-up that builds on that conversation. Omit
+            # session_id to start a fresh one (returned below).
+            user_id = (body.get("user_id") or "anonymous").strip() or "anonymous"
+            session_id = (body.get("session_id") or "").strip() or None
             session = self.manager.start(
-                question, enable_planning=plan, planning_root_only=plan_root)
+                question, user_id=user_id, session_id=session_id,
+                enable_planning=plan, planning_root_only=plan_root)
             return self._json(200, {
                 "session_id": session.id,
                 "events": f"/runs/{session.id}/events",
@@ -268,7 +327,9 @@ def build_manager(settings: Settings, data: str) -> RunManager:
         enable_interaction=True,  # the whole point of a remote client
         interaction_root_only=settings.interaction_root_only,
     )
-    return RunManager(corpus, engine)
+    # Persistent per-session envs so follow-ups resume variables + workspace.
+    pool = build_session_pool(settings)
+    return RunManager(corpus, engine, pool)
 
 
 def serve(data: str, host: str = "127.0.0.1", port: int = 8000,
@@ -280,10 +341,17 @@ def serve(data: str, host: str = "127.0.0.1", port: int = 8000,
     httpd = ThreadingHTTPServer((host, port), _Handler)
     httpd.manager = manager  # type: ignore[attr-defined]
 
+    # Reclaim idle session envs on time even without new traffic.
+    if manager._pool is not None:
+        manager._pool.start_sweeper()
+
     print(f"vomero serving corpus {manager.corpus.root} on http://{host}:{port}",
           file=sys.stderr)
     print("  POST /runs  ·  GET /runs/<id>/events (SSE)  ·  POST /runs/<id>/reply",
           file=sys.stderr)
+    if settings.workspace_root:
+        print(f"  ↻ sessions persist: variables for {settings.session_ttl:.0f}s idle, "
+              f"workspace under {settings.workspace_root}", file=sys.stderr)
     if settings.exec_backend == "sandbox":
         print(f"\n  🔒 sandbox: gVisor ({settings.sandbox_runtime}), "
               f"mem={settings.sandbox_memory} cpus={settings.sandbox_cpus} "
@@ -299,3 +367,7 @@ def serve(data: str, host: str = "127.0.0.1", port: int = 8000,
     except KeyboardInterrupt:
         print("\nshutting down", file=sys.stderr)
         httpd.shutdown()
+    finally:
+        if manager._pool is not None:
+            manager._pool.stop_sweeper()
+            manager._pool.close_all()  # tear down any warm containers
