@@ -78,20 +78,38 @@ this into a service.
 ## 2. The embedding API
 
 You don't need the CLI or the bundled server to use Vomero — they're both thin
-shells over three objects. This is all the public surface a service needs.
-
-### The corpus
+shells over a few objects. This section is the deployment-grade detail (sessions,
+threading, security). If you just want to call it from Python, start with the
+shorter **[library.md](library.md)** and its one-call `build_engine()`:
 
 ```python
-from vomero.context.corpus import Corpus
-
-corpus = Corpus("/data/my-folder")          # a read-only, lazy view of a folder
-corpus = corpus.subset(["a.md", "docs/b.md"])  # scope to specific files
+from vomero import build_engine, Context, Corpus
+engine = build_engine(model="gpt-4o-mini")          # wires client+backend+compaction
+engine.run("…", Context(big_string))                # or Corpus("/data/folder")
 ```
 
-`Corpus` never loads the folder into memory; the model navigates it with
-`grep` / `peek` / `read` / `files` from inside the REPL. The root is resolved
-and path-escapes are rejected, so a corpus can't read outside its folder.
+The rest of this section unpacks what `build_engine` assembles, plus the
+service-only pieces (Channel, sessions, multi-turn).
+
+### The source (corpus or in-memory context)
+
+```python
+from vomero.context import Corpus, Context
+
+corpus = Corpus("/data/my-folder")             # a read-only, lazy view of a folder
+corpus = corpus.subset(["a.md", "docs/b.md"])  # scope to specific files
+
+context = Context(big_string)                  # an in-memory blob held as a REPL variable
+context = Context([doc1, doc2, doc3])          # ...or a list of documents
+```
+
+Both satisfy the same `Source` seam, so `engine.run(question, source)` takes
+either. `Corpus` never loads the folder into memory; the model navigates it with
+`grep` / `peek` / `read` / `files`. The root is resolved and path-escapes are
+rejected, so a corpus can't read outside its folder. `Context` is the
+context-as-a-variable case — the model greps/slices/chunks the in-memory value.
+(Note: the gVisor sandbox mounts a folder corpus only; `Context` runs use the
+in-process backend.)
 
 ### The engine
 
@@ -158,8 +176,13 @@ engine.run(
     transcript_sink=out,    # a list the engine fills with the resumable transcript
     env=pooled_env,         # reuse a persistent env to keep variables/workspace
     enable_planning=True,   # per-request override of the engine default
-)
+    return_trajectory=True, # return a RunResult (answer + per-step trajectory + cost)
+)                           #   instead of just the answer string
 ```
+
+- **`return_trajectory`** swaps the return type from `str` to a `RunResult`
+  (`.answer`, `.trajectory` — the root agent's Steps, `.tokens`, `.calls`) for
+  inspection/eval. Off by default (back-compat).
 
 - **`history` / `transcript_sink`** give you **multi-turn conversations**: pass
   an empty list as `transcript_sink`, store it under your session key when the
@@ -210,6 +233,10 @@ A `.env` file in the working directory is loaded automatically.
 |---|---|---|
 | `VOMERO_MAX_STEPS` | `24` | REPL steps per agent loop |
 | `VOMERO_MAX_DEPTH` | `3` | recursion depth (`rlm()` sub-agents) |
+| `VOMERO_MAX_TOTAL_TOKENS` | `0` (unlimited) | global token budget across the **whole run tree**; on hit the run stops and returns its best effort |
+| `VOMERO_MAX_TOTAL_CALLS` | `0` (unlimited) | global model-call budget across the whole run tree |
+| `VOMERO_MAX_OUTPUT_CHARS` | `10000` | cap on one tool result before it enters the transcript (`0` = no cap) |
+| `VOMERO_MAX_PARALLEL_CALLS` | `8` | fan-out width for `llm_batched(...)` concurrent sub-calls |
 | `VOMERO_CONTEXT_WINDOW` | `128000` | model context window (compaction threshold = ratio × this) |
 | `VOMERO_COMPACT_RATIO` | `0.8` | compact when context hits this fraction; `0` disables |
 | `VOMERO_COMPACT_KEEP_RECENT` | `6` | recent messages kept verbatim |

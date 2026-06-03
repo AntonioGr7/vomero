@@ -92,6 +92,22 @@ Provider backends (behind one `LLMClient` protocol):
 uv run pytest        # full suite, no API key required (scripted fake client)
 ```
 
+## From Python
+
+The CLI is a thin shell over the library — drive the engine directly in three
+lines (the `dspy.RLM(...)` equivalent):
+
+```python
+from vomero import build_engine, Context
+
+engine = build_engine(model="gpt-4o-mini")          # wires client + backend + compaction
+print(engine.run("What are the key risks?", Context(open("contract.txt").read())))
+```
+
+`run(..., return_trajectory=True)` returns a `RunResult` (answer + per-step
+trajectory + cost) instead of a string. Full programmatic guide — sources,
+streaming progress, multi-turn, eval/optimize — in **[docs/library.md](docs/library.md)**.
+
 ## Token accounting & budgets
 
 Every model call is metered. Two distinct figures:

@@ -16,9 +16,11 @@ The server is bound to **one corpus** (chosen at startup) so clients never send
 filesystem paths. It reads model/provider/keys from the environment like
 `vomero ask` (see `.env.example`).
 
-> ⚠ **Not sandboxed.** Model-authored code runs in-process with `exec`.
-> Serve only trusted corpora and trusted clients until a sandboxed
-> `ExecutionEnvironment` lands. Don't expose this to the open internet as-is.
+> ⚠ **Sandbox it for untrusted input.** By default model-authored code runs
+> in-process with `exec` (fast, not isolated). Set `VOMERO_SANDBOX=1` to run each
+> step in an isolated gVisor container instead; serve in-process only to trusted
+> corpora and clients. Don't expose this reference server to the open internet
+> as-is (no auth/limits — see *Going to production*).
 
 ## Protocol
 
@@ -49,6 +51,7 @@ Every event carries `depth` and `index`. The `type` matches the SSE event name.
 | `todo` | `todo: [{text, status}]` | the live plan (if planning is on) |
 | `interaction` | `interaction: {question, answer, kind}` | a resolved ask (`kind`: `user`/`parent`) |
 | `compaction` | `compaction: {tokens_before, tokens_after, …}` | history was compacted |
+| `note` | `note` | an engine notice (e.g. the global token/call budget was exhausted) |
 | `final` | `final` | **the answer** |
 | `ask_user` | `question` | agent needs you — reply via `POST .../reply` |
 | `done` | `usage: {calls, total_tokens, …}` | run finished; final usage summary |
@@ -127,8 +130,8 @@ with urllib.request.urlopen(BASE + run["events"]) as stream:
 This is a reference/dev server (stdlib only). For real deployments, keep the
 `Channel`/threading shape and add:
 
-- **A sandbox** — the blocker. Implement a sandboxed `ExecutionEnvironment`
-  before any untrusted exposure.
+- **Turn on the sandbox** (`VOMERO_SANDBOX=1`) before any untrusted exposure —
+  the gVisor backend ships in the box; in-process `exec` is for trusted input only.
 - **Auth & limits** — the endpoints are open and unbounded.
 - **Cancellation/timeouts** — a disconnected client leaves its run finishing in
   the background; `ask_user` blocks indefinitely until a reply.
