@@ -191,7 +191,9 @@ class SandboxEnvironment(ExecutionEnvironment):
             return
         if self._corpus is None:
             raise RuntimeError(
-                "SandboxEnvironment requires inject(corpus=...) before execute()"
+                "The gVisor sandbox backend supports a folder-mounted `corpus` only; "
+                "it cannot mount an in-memory `context`. Use the in-process backend "
+                "(VOMERO_EXEC_BACKEND=inprocess) for context-as-a-variable runs."
             )
 
         self._tmpdir = tempfile.mkdtemp(prefix="vomero-sock-")

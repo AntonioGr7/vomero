@@ -197,6 +197,12 @@ def cmd_ask(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
+    if settings.exec_backend == "sandbox" and isinstance(source, Context):
+        print("error: --sandbox / VOMERO_SANDBOX supports a folder corpus only; an "
+              "in-memory --text context needs the in-process backend. Drop the "
+              "sandbox flag for context-as-a-variable runs.", file=sys.stderr)
+        return 2
+
     compactor = None
     if settings.compact_ratio > 0:
         compactor = Compactor(
@@ -277,18 +283,28 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 def cmd_eval(args: argparse.Namespace) -> int:
     """Measure RLM vs. a stuff-the-context baseline on a benchmark."""
-    from .eval import (RLMRunner, StuffBaselineRunner, compare,
-                       load_jsonl, load_multihoprag)
+    from .eval import (ClosedBookRunner, RLMRunner, StuffBaselineRunner, compare,
+                       load_jsonl, load_multihoprag, make_needle_items)
 
     settings = Settings.from_env()
     if args.model:
         settings.model = args.model
+    # Eval is a trusted local measurement; default to fast in-process execution.
+    # Per-item gVisor containers would be slow, and the sandbox can't mount an
+    # in-memory context anyway. Opt back in with --sandbox (folder corpora only).
+    if not args.sandbox:
+        settings.exec_backend = "inprocess"
 
     # Load items (each carries the question, gold answer, and its data source).
     try:
         if args.jsonl:
             source = Corpus(args.data) if args.data else None
             items = load_jsonl(args.jsonl, source=source, limit=args.limit)
+        elif args.benchmark == "needle":
+            items = make_needle_items(
+                n=args.limit, total_chars=args.needle_chars,
+                filler=Corpus(args.data) if args.data else None,
+            )
         elif args.benchmark == "multihoprag":
             items = load_multihoprag(args.data or "data/multihoprag",
                                      limit=args.limit, mode=args.source_mode)
@@ -299,6 +315,12 @@ def cmd_eval(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
+    if settings.exec_backend == "sandbox" and any(isinstance(it.source, Context) for it in items):
+        print("error: the gVisor sandbox can't mount an in-memory context; run "
+              "context/needle evals on the in-process backend (drop --sandbox).",
+              file=sys.stderr)
+        return 2
+
     client = build_client(settings)
     compactor = None
     if settings.compact_ratio > 0:
@@ -307,23 +329,54 @@ def cmd_eval(args: argparse.Namespace) -> int:
             keep_recent_messages=settings.compact_keep_recent,
             min_reclaim_tokens=settings.compact_min_reclaim,
         )
+    # Terse-answer instruction (default ON): gold answers are short spans, so a
+    # verbose-but-correct answer is unfairly punished by EM/F1. Applies to BOTH
+    # systems for a fair comparison.
+    from .eval.runners import TERSE_ANSWER
+    terse = not args.no_terse
     engine = RLMEngine(
         client, env_factory=build_env_factory(settings), model=settings.model,
         max_steps=settings.max_steps, max_depth=settings.max_depth,
         max_output_chars=settings.max_output_chars,
         max_parallel_calls=settings.max_parallel_calls, compactor=compactor,
+        extra_instructions=TERSE_ANSWER if terse else None,
     )
 
+    # Give the baseline its REAL window: ~4 chars/token of the model's context
+    # window. Truncation then reflects the actual limit — so `truncated%` tells
+    # you whether the data genuinely overflows (the regime where RLM should win).
+    baseline_max_chars = int(settings.context_window * 4)
+
     runners = []
-    if args.mode in ("rlm", "both"):
+    if args.mode in ("rlm", "both", "all"):
         runners.append(RLMRunner(engine, max_total_tokens=settings.max_total_tokens,
                                  max_total_calls=settings.max_total_calls))
-    if args.mode in ("baseline", "both"):
-        runners.append(StuffBaselineRunner(client, model=settings.model))
+    if args.mode in ("baseline", "both", "all"):
+        runners.append(StuffBaselineRunner(client, model=settings.model,
+                                           max_chars=baseline_max_chars, terse=terse))
+    # The contamination control: answers with no context (parametric memory only).
+    if args.mode in ("closed_book", "all"):
+        runners.append(ClosedBookRunner(client, model=settings.model, terse=terse))
+
+    # Report the regime: how big is the data vs. the baseline's window? If the
+    # data fits, the baseline can win without RLM ever being needed. (Cheap
+    # estimate — len() for a context, file stats for a corpus; no full read.)
+    shared = items[0].source if items else None
+    if isinstance(shared, Context):
+        size = len(shared)
+    elif isinstance(shared, Corpus):
+        size = sum(shared.size(p) for p in shared.files())
+    else:
+        size = None
+    if size is not None:
+        fits = "fits" if size <= baseline_max_chars else "OVERFLOWS"
+        print(f"Data ≈{size:,} chars; baseline window ≈{baseline_max_chars:,} chars "
+              f"→ context {fits} the baseline.", file=sys.stderr)
 
     judge_client = client if args.judge else None
     print(f"Evaluating {len(items)} item(s) with: {', '.join(r.name for r in runners)}"
-          + ("  (LLM-judged)" if args.judge else ""), file=sys.stderr)
+          + ("  (terse)" if terse else "") + ("  (LLM-judged)" if args.judge else ""),
+          file=sys.stderr)
 
     def progress(r):
         mark = "✓" if (r.judge or r.contains or r.exact) else "·"
@@ -392,18 +445,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     ev = sub.add_parser("eval", help="Measure RLM vs. a stuff-the-context baseline on a benchmark.")
     ev.add_argument("--benchmark", default="multihoprag",
-                    help="Built-in benchmark to run (default: multihoprag).")
+                    help="Built-in benchmark: 'multihoprag' or 'needle' (leakage-proof "
+                         "synthetic needle-in-a-haystack).")
+    ev.add_argument("--needle-chars", type=int, default=2_000_000,
+                    help="Haystack size in chars for --benchmark needle (default 2M ≈ 500k tokens).")
     ev.add_argument("--jsonl", default=None,
                     help="Instead of a built-in: a JSONL file of {question, answer, context?} rows.")
     ev.add_argument("--data", default=None,
                     help="Corpus folder (benchmark default, or the shared source for --jsonl rows).")
-    ev.add_argument("--mode", choices=["rlm", "baseline", "both"], default="both",
-                    help="Which system(s) to score (default: both).")
+    ev.add_argument("--mode", choices=["rlm", "baseline", "closed_book", "both", "all"],
+                    default="both",
+                    help="Which system(s) to score. 'closed_book' = no-context control "
+                         "(measures training-data leakage); 'all' = rlm+baseline+closed_book.")
     ev.add_argument("--source-mode", choices=["corpus", "context"], default="corpus",
                     help="Mount the benchmark data as a folder or one in-memory context.")
-    ev.add_argument("--limit", type=int, default=20, help="Max items to evaluate (default 20).")
+    ev.add_argument("--limit", type=int, default=50, help="Max items to evaluate (default 50).")
+    ev.add_argument("--no-terse", action="store_true",
+                    help="Don't instruct either system to answer with a short span "
+                         "(terse is on by default so EM/F1 are a fair comparison).")
     ev.add_argument("--judge", action="store_true",
                     help="Also grade each answer with an LLM judge (for free-form answers).")
+    ev.add_argument("--sandbox", action="store_true",
+                    help="Run the RLM's code in the gVisor sandbox (folder corpora only; "
+                         "default is fast in-process execution for evals).")
     ev.add_argument("--model", default=None, help="Override the model name.")
     ev.set_defaults(func=cmd_eval)
     return p

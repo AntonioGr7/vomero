@@ -21,6 +21,16 @@ from ..llm.base import Message
 from ..usage import UsageMeter
 
 
+# A terse-answer instruction shared by both runners so EM/F1 are a FAIR
+# comparison: gold answers in these benchmarks are short spans, so a verbose
+# (but correct) answer is unfairly punished by string metrics. Applied to the
+# RLM engine via `extra_instructions` and to the baseline's system prompt.
+TERSE_ANSWER = (
+    "Answer with ONLY the shortest exact answer span — a name, entity, number, "
+    "date, or yes/no. No explanation, no full sentence, no surrounding text."
+)
+
+
 @dataclass
 class Outcome:
     answer: str
@@ -60,25 +70,31 @@ class StuffBaselineRunner:
 
     name = "baseline"
 
-    _SYSTEM = (
-        "Answer the question using ONLY the provided context. Be concise and "
-        "answer directly."
-    )
+    _SYSTEM = "Answer the question using ONLY the provided context."
 
-    def __init__(self, client, *, model=None, max_chars: int = 400_000):
+    def __init__(self, client, *, model=None, max_chars: int = 400_000, terse: bool = False):
         self.client = client
         self.model = model
         self.max_chars = max_chars
+        self.system = self._SYSTEM + ("\n" + TERSE_ANSWER if terse else "")
+        # Rendering a folder reads every file; cache per source so a shared
+        # corpus isn't re-read once per question.
+        self._cache: dict[int, str] = {}
+
+    def _full_text(self, source) -> str:
+        key = id(source)
+        if key not in self._cache:
+            if isinstance(source, Context):
+                text = source.text
+            elif isinstance(source, Corpus):
+                text = "\n\n".join(f"### {p}\n{source.read(p)}" for p in source.files())
+            else:  # best effort for any other Source
+                text = str(source.overview())
+            self._cache[key] = text
+        return self._cache[key]
 
     def _render(self, source) -> tuple[str, bool]:
-        if isinstance(source, Context):
-            text = source.text
-        elif isinstance(source, Corpus):
-            text = "\n\n".join(
-                f"### {p}\n{source.read(p)}" for p in source.files()
-            )
-        else:  # best effort for any other Source
-            text = str(source.overview())
+        text = self._full_text(source)
         truncated = len(text) > self.max_chars
         return (text[: self.max_chars] if truncated else text), truncated
 
@@ -86,7 +102,7 @@ class StuffBaselineRunner:
         context, truncated = self._render(source)
         meter = UsageMeter()
         msgs = [
-            Message("system", self._SYSTEM),
+            Message("system", self.system),
             Message("user", f"Context:\n{context}\n\nQuestion: {question}"),
         ]
         t0 = time.monotonic()
@@ -95,4 +111,36 @@ class StuffBaselineRunner:
         return Outcome(
             answer=resp.content or "", tokens=meter.total_tokens, calls=meter.calls,
             seconds=time.monotonic() - t0, truncated=truncated,
+        )
+
+
+class ClosedBookRunner:
+    """The contamination control: answer with NO context at all, purely from the
+    model's parametric memory. Its score is the leakage floor — on a benchmark
+    built from public text the model was trained on, the model may already
+    "know" the answers. The real context contribution of any context-using
+    system is *its* score minus this one. If closed-book ≈ baseline, the task
+    isn't testing context use, and RLM-vs-baseline is meaningless."""
+
+    name = "closed_book"
+
+    _SYSTEM = (
+        "Answer the question from your own knowledge alone. No documents are "
+        "provided. If unsure, give your single best guess."
+    )
+
+    def __init__(self, client, *, model=None, terse: bool = False):
+        self.client = client
+        self.model = model
+        self.system = self._SYSTEM + ("\n" + TERSE_ANSWER if terse else "")
+
+    def answer(self, question: str, source) -> Outcome:  # source ignored, by design
+        meter = UsageMeter()
+        msgs = [Message("system", self.system), Message("user", f"Question: {question}")]
+        t0 = time.monotonic()
+        resp = self.client.complete(msgs, model=self.model)
+        meter.record(resp.usage, sent_messages=msgs, response_text=resp.content)
+        return Outcome(
+            answer=resp.content or "", tokens=meter.total_tokens, calls=meter.calls,
+            seconds=time.monotonic() - t0,
         )

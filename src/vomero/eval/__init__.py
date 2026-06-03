@@ -7,14 +7,14 @@ dataset adapter, then `compare()` the `RLMRunner` against the
 
 from __future__ import annotations
 
-from .datasets import load_jsonl, load_multihoprag
+from .datasets import load_jsonl, load_multihoprag, make_needle_items
 from .harness import EvalItem, ItemResult, Report, compare, evaluate
 from .optimize import OptimizeResult, optimize, propose_instructions
-from .runners import Outcome, RLMRunner, StuffBaselineRunner
+from .runners import ClosedBookRunner, Outcome, RLMRunner, StuffBaselineRunner
 
 __all__ = [
     "EvalItem", "ItemResult", "Report", "evaluate", "compare",
-    "Outcome", "RLMRunner", "StuffBaselineRunner",
-    "load_jsonl", "load_multihoprag",
+    "Outcome", "RLMRunner", "StuffBaselineRunner", "ClosedBookRunner",
+    "load_jsonl", "load_multihoprag", "make_needle_items",
     "optimize", "OptimizeResult", "propose_instructions",
 ]
