@@ -16,9 +16,11 @@ from __future__ import annotations
 import argparse
 import sys
 
+from pathlib import Path
+
 from .channel import CallbackChannel
 from .config import Settings
-from .context.corpus import Corpus
+from .context import Context, Corpus
 from .engine import Compactor, RLMEngine
 from .engine.rlm import Step
 from .execution import build_env_factory
@@ -30,6 +32,11 @@ def _clip(text: str, limit: int) -> str:
     """Collapse whitespace and truncate, for one-line previews."""
     text = " ".join(text.split())
     return text if len(text) <= limit else text[:limit] + " …"
+
+
+def _read_text(path: str) -> str:
+    """Read a file as the in-memory context blob (for `--text PATH`)."""
+    return Path(path).expanduser().read_text(encoding="utf-8", errors="replace")
 
 
 def _verbose_printer():
@@ -76,6 +83,8 @@ def _verbose_printer():
             glyph, who = ("↑", "parent") if it.kind == "parent" else ("❓", "user")
             print(f"{tag} {glyph} asked {who}: {_clip(it.question, 200)}\n"
                   f"{pad}   ↳ {who}: {_clip(it.answer, 200)}", file=stream)
+        elif step.note is not None:
+            print(f"{tag} ⚠ {step.note}", file=stream)
         elif step.final is not None:
             print(f"{tag} FINAL (depth {step.depth}):\n{pad}  "
                   + step.final.replace("\n", "\n" + pad + "  "), file=stream)
@@ -137,6 +146,12 @@ def cmd_ask(args: argparse.Namespace) -> int:
         settings.max_depth = args.max_depth
     if args.max_steps is not None:
         settings.max_steps = args.max_steps
+    if args.max_output_chars is not None:
+        settings.max_output_chars = args.max_output_chars
+    if args.max_total_tokens is not None:
+        settings.max_total_tokens = args.max_total_tokens
+    if args.max_total_calls is not None:
+        settings.max_total_calls = args.max_total_calls
     if args.context_window is not None:
         settings.context_window = args.context_window
     if args.compact_ratio is not None:
@@ -167,9 +182,18 @@ def cmd_ask(args: argparse.Namespace) -> int:
     # real terminal — without one, `ask_user` degrades gracefully.
     human_reachable = settings.enable_interaction and sys.stdin.isatty()
 
+    # Mount the data as a `Source`: a folder (`--data`) or an in-memory blob
+    # (`--text PATH`, or `--text -` to read the context from stdin). Exactly one.
+    if bool(args.data) == bool(args.text):
+        print("error: pass exactly one of --data <folder> or --text <file|->", file=sys.stderr)
+        return 2
     try:
-        corpus = Corpus(args.data)
-    except FileNotFoundError as e:
+        if args.data:
+            source = Corpus(args.data)
+        else:
+            blob = sys.stdin.read() if args.text == "-" else _read_text(args.text)
+            source = Context(blob)
+    except (FileNotFoundError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
@@ -189,6 +213,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
         model=settings.model,
         max_steps=settings.max_steps,
         max_depth=settings.max_depth,
+        max_output_chars=settings.max_output_chars,
+        max_parallel_calls=settings.max_parallel_calls,
         compactor=compactor,
         enable_planning=settings.enable_planning,
         planning_root_only=settings.planning_root_only,
@@ -213,9 +239,13 @@ def cmd_ask(args: argparse.Namespace) -> int:
     ask_handler = _terminal_ask_handler() if human_reachable else None
     channel = CallbackChannel(on_event=on_event, ask_handler=ask_handler)
 
-    # Caller owns the meter; the engine keeps no per-run state.
-    meter = UsageMeter()
-    answer = engine.run(args.question, corpus, channel=channel, meter=meter)
+    # Caller owns the meter; the engine keeps no per-run state. The budget rides
+    # on the meter, so it spans the root loop and every recursive sub-call.
+    meter = UsageMeter(
+        max_total_tokens=settings.max_total_tokens,
+        max_total_calls=settings.max_total_calls,
+    )
+    answer = engine.run(args.question, source, channel=channel, meter=meter)
     if args.verbose:
         print("\n" + "=" * 60, file=sys.stderr)
     print(answer)
@@ -245,16 +275,88 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_eval(args: argparse.Namespace) -> int:
+    """Measure RLM vs. a stuff-the-context baseline on a benchmark."""
+    from .eval import (RLMRunner, StuffBaselineRunner, compare,
+                       load_jsonl, load_multihoprag)
+
+    settings = Settings.from_env()
+    if args.model:
+        settings.model = args.model
+
+    # Load items (each carries the question, gold answer, and its data source).
+    try:
+        if args.jsonl:
+            source = Corpus(args.data) if args.data else None
+            items = load_jsonl(args.jsonl, source=source, limit=args.limit)
+        elif args.benchmark == "multihoprag":
+            items = load_multihoprag(args.data or "data/multihoprag",
+                                     limit=args.limit, mode=args.source_mode)
+        else:
+            print(f"error: unknown benchmark {args.benchmark!r}", file=sys.stderr)
+            return 2
+    except (FileNotFoundError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    client = build_client(settings)
+    compactor = None
+    if settings.compact_ratio > 0:
+        compactor = Compactor(
+            context_window=settings.context_window, ratio=settings.compact_ratio,
+            keep_recent_messages=settings.compact_keep_recent,
+            min_reclaim_tokens=settings.compact_min_reclaim,
+        )
+    engine = RLMEngine(
+        client, env_factory=build_env_factory(settings), model=settings.model,
+        max_steps=settings.max_steps, max_depth=settings.max_depth,
+        max_output_chars=settings.max_output_chars,
+        max_parallel_calls=settings.max_parallel_calls, compactor=compactor,
+    )
+
+    runners = []
+    if args.mode in ("rlm", "both"):
+        runners.append(RLMRunner(engine, max_total_tokens=settings.max_total_tokens,
+                                 max_total_calls=settings.max_total_calls))
+    if args.mode in ("baseline", "both"):
+        runners.append(StuffBaselineRunner(client, model=settings.model))
+
+    judge_client = client if args.judge else None
+    print(f"Evaluating {len(items)} item(s) with: {', '.join(r.name for r in runners)}"
+          + ("  (LLM-judged)" if args.judge else ""), file=sys.stderr)
+
+    def progress(r):
+        mark = "✓" if (r.judge or r.contains or r.exact) else "·"
+        print(f"  {mark} {_clip(r.question, 70)}  (EM {r.exact:.0f} F1 {r.f1:.2f} "
+              f"{r.tokens:,} tok)", file=sys.stderr)
+
+    reports = compare(items, runners, judge_client=judge_client,
+                      judge_model=settings.model, on_item=progress)
+    print("\n" + "=" * 70, file=sys.stderr)
+    for rep in reports:
+        print(rep.summary())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="vomero", description="Recursive LM assistant over a data folder.")
     sub = p.add_subparsers(dest="command", required=True)
 
     ask = sub.add_parser("ask", help="Ask a question about a data folder.")
     ask.add_argument("question", help="The question to answer.")
-    ask.add_argument("--data", required=True, help="Path to the data folder (the corpus).")
+    ask.add_argument("--data", default=None, help="Path to the data folder (the corpus).")
+    ask.add_argument("--text", default=None,
+                     help="Mount an in-memory context instead of a folder: a file path, "
+                          "or '-' to read the context from stdin. (RLM context-as-a-variable.)")
     ask.add_argument("--model", default=None, help="Override the model name.")
     ask.add_argument("--max-depth", type=int, default=None, help="Max recursion depth.")
     ask.add_argument("--max-steps", type=int, default=None, help="Max REPL steps per level.")
+    ask.add_argument("--max-output-chars", type=int, default=None,
+                     help="Cap a single tool result's size before it enters context (0 = no cap).")
+    ask.add_argument("--max-total-tokens", type=int, default=None,
+                     help="Global token budget across the whole run tree (0 = unlimited).")
+    ask.add_argument("--max-total-calls", type=int, default=None,
+                     help="Global model-call budget across the whole run tree (0 = unlimited).")
     ask.add_argument("--context-window", type=int, default=None,
                      help="Model context window in tokens (compaction threshold = ratio * this).")
     ask.add_argument("--compact-ratio", type=float, default=None,
@@ -287,6 +389,23 @@ def build_parser() -> argparse.ArgumentParser:
     srv.add_argument("--port", type=int, default=8000, help="Bind port (default 8000).")
     srv.add_argument("--model", default=None, help="Override the model name.")
     srv.set_defaults(func=cmd_serve)
+
+    ev = sub.add_parser("eval", help="Measure RLM vs. a stuff-the-context baseline on a benchmark.")
+    ev.add_argument("--benchmark", default="multihoprag",
+                    help="Built-in benchmark to run (default: multihoprag).")
+    ev.add_argument("--jsonl", default=None,
+                    help="Instead of a built-in: a JSONL file of {question, answer, context?} rows.")
+    ev.add_argument("--data", default=None,
+                    help="Corpus folder (benchmark default, or the shared source for --jsonl rows).")
+    ev.add_argument("--mode", choices=["rlm", "baseline", "both"], default="both",
+                    help="Which system(s) to score (default: both).")
+    ev.add_argument("--source-mode", choices=["corpus", "context"], default="corpus",
+                    help="Mount the benchmark data as a folder or one in-memory context.")
+    ev.add_argument("--limit", type=int, default=20, help="Max items to evaluate (default 20).")
+    ev.add_argument("--judge", action="store_true",
+                    help="Also grade each answer with an LLM judge (for free-form answers).")
+    ev.add_argument("--model", default=None, help="Override the model name.")
+    ev.set_defaults(func=cmd_eval)
     return p
 
 

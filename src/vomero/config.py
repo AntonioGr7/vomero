@@ -31,6 +31,17 @@ class Settings:
     # RLM loop limits
     max_steps: int = 24
     max_depth: int = 3
+    # Hard cap (chars) on a single tool result before it enters the transcript,
+    # so one oversized print can't permanently bloat the protected recent tail.
+    # 0 disables truncation.
+    max_output_chars: int = 10_000
+    # Fan-out width for llm_batched(...) — max concurrent flat sub-calls.
+    max_parallel_calls: int = 8
+    # Global budget across the WHOLE run tree (root + every recursive sub-call),
+    # enforced on the shared UsageMeter. The run stops spawning model calls once
+    # a limit is met and returns its best effort. Both 0 = unlimited.
+    max_total_tokens: int = 0
+    max_total_calls: int = 0
 
     # Execution backend for the model's code. "inprocess" (default) runs it
     # in-process with `exec` — fast and full-power, but NOT sandboxed; fine for
@@ -96,6 +107,10 @@ class Settings:
             ),
             max_steps=int(os.getenv("VOMERO_MAX_STEPS", "24")),
             max_depth=int(os.getenv("VOMERO_MAX_DEPTH", "3")),
+            max_output_chars=int(os.getenv("VOMERO_MAX_OUTPUT_CHARS", "10000")),
+            max_parallel_calls=int(os.getenv("VOMERO_MAX_PARALLEL_CALLS", "8")),
+            max_total_tokens=int(os.getenv("VOMERO_MAX_TOTAL_TOKENS", "0")),
+            max_total_calls=int(os.getenv("VOMERO_MAX_TOTAL_CALLS", "0")),
             # VOMERO_SANDBOX=1 is a friendly shortcut for VOMERO_EXEC_BACKEND=sandbox.
             exec_backend=(
                 "sandbox"

@@ -12,7 +12,7 @@ Designed to be self-describing: the methods double as the model's API, and
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 # Extensions we treat as text-readable by default.
@@ -36,6 +36,9 @@ class Match:
 class Corpus:
     """A read-only, lazy handle on a folder of data/documents.
 
+    Satisfies the `Source` seam (see context/source.py), so the engine drives it
+    interchangeably with an in-memory `Context`.
+
     Parameters
     ----------
     root:
@@ -44,6 +47,9 @@ class Corpus:
         Optional explicit list of relative paths this view is restricted to
         (used by `subset` so recursive sub-calls can be scoped).
     """
+
+    # The REPL variable name the engine injects this under (the `Source` seam).
+    repl_name = "corpus"
 
     def __init__(self, root: str | Path, allow: list[str] | None = None):
         self.root = Path(root).expanduser().resolve()
@@ -138,6 +144,24 @@ class Corpus:
         body = "\n".join(f"  - {f}" for f in shown)
         more = f"\n  ... and {n - max_files} more" if n > max_files else ""
         return f"Corpus at {self.root} — {n} text file(s):\n{body}{more}"
+
+    # -- Source seam (system-prompt surface) -----------------------------
+    def guide(self) -> str:
+        """The methods block the engine splices into the system prompt."""
+        return (
+            "  corpus        A read-only handle on the data folder. Key methods:\n"
+            "                  corpus.overview()           -> summary + file list (start here)\n"
+            "                  corpus.tree()               -> file tree\n"
+            "                  corpus.files(glob=\"**/*\")   -> list of relative paths\n"
+            "                  corpus.grep(pattern, ...)   -> regex search -> [Match(path, lineno, line)]\n"
+            "                  corpus.peek(path, lines=40) -> first lines of a file\n"
+            "                  corpus.read(path)           -> full text of a file\n"
+            "                  corpus.size(path)           -> bytes\n"
+            "                  corpus.subset([paths])      -> a corpus scoped to those files\n"
+        )
+
+    def start_hint(self) -> str:
+        return "corpus.overview()"
 
     def __repr__(self) -> str:
         scope = "" if self._allow is None else f", scoped to {len(self._allow)} files"

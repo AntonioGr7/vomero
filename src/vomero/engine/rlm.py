@@ -1,25 +1,31 @@
 """RLMEngine — the recursive REPL loop.
 
 Flow (one `run`):
-  1. Spin up an ExecutionEnvironment and inject the navigation surface:
-     `corpus`, `llm(...)`, `rlm(...)`, `answer(...)`.
+  1. Spin up an ExecutionEnvironment and inject the navigation surface: the data
+     handle (a `Source` — `corpus` or `context`), `llm(...)`, `rlm(...)`,
+     `answer(...)`.
   2. Give the root model a system prompt describing that surface, plus the
      user's question. It can ONLY act via the `python` tool.
   3. Each step: model -> python(code) -> we exec -> feed stdout/traceback back.
   4. Stop when the model calls `answer(...)` from the REPL, or replies with
      plain text (no tool call). Either becomes the final answer.
 
+The data is a `Source` (context/source.py): either a `Corpus` (a folder) or a
+`Context` (an in-memory blob held as a REPL variable — the canonical RLM case).
+The engine is agnostic between them.
+
 The recursion: `llm()` is a flat sub-call (cheap distillation of a chunk);
-`rlm()` re-enters this engine on a (optionally scoped) corpus at depth+1, so a
+`rlm()` re-enters this engine on a (optionally scoped) source at depth+1, so a
 sub-question gets the same full power. Depth is capped to keep it finite.
 """
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable
 
-from ..context.corpus import Corpus
+from ..context.source import Source
 from ..execution import ExecutionEnvironment, InProcessEnvironment
 from ..llm.base import LLMClient, Message, ToolSpec
 from ..channel import Channel, CallbackChannel
@@ -30,6 +36,13 @@ from .todo import TodoItem, TodoList
 # The single tool the root model gets. Keeping it to one tool (run Python)
 # maps cleanly onto every provider's function-calling and matches the RLM idea:
 # the model's lever on the world is code.
+# Returned from llm()/rlm() when the global budget is spent, so the model's code
+# keeps running (and can call answer()) instead of erroring mid-step.
+_BUDGET_NOTICE = (
+    "[budget exhausted: this sub-call was skipped to keep the run within its "
+    "token/call limit. Answer now with what you already have.]"
+)
+
 PYTHON_TOOL = ToolSpec(
     name="python",
     description=(
@@ -46,48 +59,96 @@ PYTHON_TOOL = ToolSpec(
     },
 )
 
-SYSTEM_PROMPT = """You are Vomero, an assistant that answers questions about a \
-collection of files WITHOUT loading them into your own context. The data is too \
-large and too important to paste into this conversation. Instead you operate a \
-Python REPL via the `python` tool and reason *programmatically* over the data.
+# The system prompt is assembled per run from three parts: a generic head, the
+# source-specific surface (`source.guide()` — corpus vs. in-memory context), and
+# the shared helpers/strategy. Splitting it this way keeps the prompt accurate
+# whichever `Source` is mounted, with no corpus/context assumptions baked in.
+SYSTEM_PROMPT_HEAD = """You are Vomero, an assistant that answers questions about \
+a body of data WITHOUT loading it into your own context. The data is too large \
+and too important to paste into this conversation. Instead you operate a Python \
+REPL via the `python` tool and reason *programmatically* over the data.
 
 Your REPL already has these names available:
 
-  corpus        A read-only handle on the data folder. Key methods:
-                  corpus.overview()           -> summary + file list (start here)
-                  corpus.tree()               -> file tree
-                  corpus.files(glob="**/*")   -> list of relative paths
-                  corpus.grep(pattern, ...)   -> regex search -> [Match(path, lineno, line)]
-                  corpus.peek(path, lines=40) -> first lines of a file
-                  corpus.read(path)           -> full text of a file
-                  corpus.size(path)           -> bytes
-                  corpus.subset([paths])      -> a corpus scoped to those files
+"""
 
+# `{name}` is the data handle's REPL name; `{start}` its first-call hint.
+HELPERS_AND_STRATEGY = """
   llm(text, system=None) -> str
                 A single, fresh model call with NO memory and NO tools. Use it to
                 distill a chunk you have already read into a variable, e.g.
                 summarize, extract, or answer a narrow question about that text.
                 The chunk you pass is the ONLY thing that sub-call sees.
 
-  rlm(question, paths=None) -> str
-                A recursive Vomero call on the (optionally scoped) corpus. Use it
-                to delegate a self-contained sub-question that itself needs
-                exploration. Returns the sub-answer as a string.
+  llm_batched(texts, system=None) -> list[str]
+                Like llm(), but runs MANY distillations concurrently and returns
+                the results in input order. This is the partition+map workhorse:
+                split the data into chunks (e.g. {name}.chunk(...)), then distill
+                them all in parallel — far faster than calling llm() in a loop.
 
-  answer(text)  Record your FINAL answer and finish.
+  rlm(question, scope=None) -> str
+                A recursive Vomero call on the (optionally scoped) data. Use it
+                to delegate a self-contained sub-question that itself needs
+                exploration. `scope` narrows what the sub-call sees, using the
+                same selector `{name}.subset(...)` takes. Returns the sub-answer.
+
+  answer(value) Record your FINAL answer and finish. `value` may be a string OR
+                any REPL variable — pass a variable you built up (e.g.
+                answer(report)) and its FULL contents become the answer. Because
+                you reference it by name, the answer can be arbitrarily long: it
+                is NOT limited by your own output size. Assemble long outputs
+                programmatically in a variable, then answer(that_variable).
 
 Strategy:
-  - Start by calling corpus.overview() (print it) to see what you have.
-  - Locate relevant files with grep/files; peek before reading whole files.
-  - NEVER print the full text of a large file into the transcript. Read it into
-    a variable and pass it to llm()/rlm() to distill — keep raw text out of your
+  - Start by calling {start} (print it) to see what you have.
+  - Locate what's relevant by searching/slicing before reading wholesale.
+  - NEVER print a large amount of raw text into the transcript. Hold it in a
+    variable and pass it to llm()/rlm() to distill — keep raw text out of your
     own context.
   - For multi-hop questions, chain: find A, then use what you learned to find B,
     cross-check, aggregate.
-  - Verify before answering: re-grep to confirm claims, count, cite file paths.
-  - When confident, call answer("..."), citing the file paths you relied on.
+  - Verify before answering: re-check claims, count, and cite your sources.
+  - When confident, call answer(...) — a string, or a variable holding your
+    full result — citing what you relied on.
 
 Keep each code block small and purposeful. Print only what you need to see."""
+
+
+def build_system_prompt(source, extra: str | None = None) -> str:
+    """Assemble the root system prompt for a given `Source` (corpus/context).
+
+    `extra` is an optional instruction block appended verbatim — the tunable
+    surface the prompt optimizer (eval/optimize.py) searches over."""
+    prompt = (
+        SYSTEM_PROMPT_HEAD
+        + source.guide()
+        + HELPERS_AND_STRATEGY.format(name=source.repl_name, start=source.start_hint())
+    )
+    if extra and extra.strip():
+        prompt += "\n\nAdditional instructions:\n" + extra.strip()
+    return prompt
+
+
+def truncate_output(text: str, limit: int) -> str:
+    """Cap a tool result before it enters the transcript.
+
+    A single oversized `print` would otherwise land in the protected recent
+    tail — which compaction never summarizes — and permanently bloat context.
+    We keep the head and tail (the most load-bearing parts of a traceback or a
+    listing) and elide the middle with a marker that nudges the model to slice/
+    grep or distill instead of printing wholesale. `limit <= 0` disables it.
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = int(limit * 0.6)
+    tail = limit - head
+    dropped = len(text) - head - tail
+    marker = (
+        f"\n\n…[output truncated: {dropped:,} of {len(text):,} chars elided. "
+        "Don't print large values wholesale — slice/grep them, or hold them in a "
+        "variable and pass to llm()/rlm() to distill.]…\n\n"
+    )
+    return text[:head] + marker + text[-tail:]
 
 
 # Appended to the system prompt only when planning is enabled.
@@ -180,6 +241,41 @@ class Step:
     compaction: CompactionEvent | None = None
     # A flat `llm()` sub-call made from within the model's code this step.
     llm_call: LLMCall | None = None
+    # An engine-level notice (e.g. the global budget was exhausted).
+    note: str | None = None
+
+
+@dataclass
+class RunResult:
+    """Structured outcome of a root `run(..., return_trajectory=True)`.
+
+    The default `run` returns just the answer string (back-compat). Opting in
+    returns this instead: the answer plus the per-step `trajectory` (the root
+    agent's Steps — code, output, messages, sub-calls) and the run's cost. The
+    trajectory is what the prompt optimizer and downstream tooling inspect."""
+
+    answer: str
+    trajectory: list[Step]
+    tokens: int
+    calls: int
+
+
+class _TrajectoryRecorder:
+    """A Channel wrapper that captures the root agent's Steps while delegating
+    every event to the real channel. Only depth-0 steps are kept (sub-agent
+    steps belong to their own recursive runs)."""
+
+    def __init__(self, inner: Channel):
+        self.inner = inner
+        self.steps: list[Step] = []
+
+    def emit(self, step: Step) -> None:
+        if step.depth == 0:
+            self.steps.append(step)
+        self.inner.emit(step)
+
+    def ask_user(self, question: str) -> str:
+        return self.inner.ask_user(question)
 
 
 class RLMEngine:
@@ -191,6 +287,9 @@ class RLMEngine:
         model: str | None = None,
         max_steps: int = 24,
         max_depth: int = 3,
+        max_output_chars: int = 10_000,
+        max_parallel_calls: int = 8,
+        extra_instructions: str | None = None,
         compactor: Compactor | None = None,
         enable_planning: bool = False,
         planning_root_only: bool = False,
@@ -202,6 +301,15 @@ class RLMEngine:
         self.model = model
         self.max_steps = max_steps
         self.max_depth = max_depth
+        # Hard cap on a single tool result's size (chars) before it enters the
+        # transcript. Guards the protected recent-tail against one giant print.
+        self.max_output_chars = max_output_chars
+        # Max concurrent flat sub-calls in one llm_batched(...) — the fan-out
+        # width for the partition+map pattern.
+        self.max_parallel_calls = max_parallel_calls
+        # Optional instruction block appended to the system prompt — the surface
+        # the prompt optimizer tunes. Plain config (not per-run state).
+        self.extra_instructions = extra_instructions
         # When True, inject a `todo` plan surface and tell the model to use it.
         self.enable_planning = enable_planning
         # By default every depth keeps its own plan (recursive sub-agents plan
@@ -221,7 +329,7 @@ class RLMEngine:
     def run(
         self,
         question: str,
-        corpus: Corpus,
+        source: Source,
         *,
         depth: int = 0,
         channel: Channel | None = None,
@@ -251,13 +359,28 @@ class RLMEngine:
         # `channel` is given. New frontends should pass a `channel` instead.
         on_event: Callable[[Step], None] | None = None,
         ask_handler: Callable[[str], str] | None = None,
-    ) -> str:
+        # Opt-in: return a RunResult (answer + per-step trajectory + cost) instead
+        # of the bare answer string. Root-level only; recursion always returns a
+        # string (rlm() consumes sub-answers as strings). Default off = back-compat.
+        return_trajectory: bool = False,
+    ) -> str | RunResult:
         # The frontend is a single Channel. Pass your own UsageMeter to read
         # token usage after the run — the engine keeps no per-run state, so the
         # same engine instance is safe to use from concurrent threads.
         if channel is None:
             channel = CallbackChannel(on_event=on_event, ask_handler=ask_handler)
+        # Capture the root agent's steps when a trajectory was requested.
+        recorder = _TrajectoryRecorder(channel) if return_trajectory else None
+        if recorder is not None:
+            channel = recorder
         meter = meter or UsageMeter()
+
+        def _finish(ans: str):
+            """Wrap the answer as a RunResult when a trajectory was requested."""
+            if recorder is None:
+                return ans
+            return RunResult(answer=ans, trajectory=recorder.steps,
+                            tokens=meter.total_tokens, calls=meter.calls)
         # Resolve per-run planning against the engine defaults (so recursion and
         # the server can override without mutating the shared engine).
         if enable_planning is None:
@@ -303,14 +426,17 @@ class RLMEngine:
             ))
             return reply
 
-        def llm(text: str, system: str | None = None) -> str:
+        def _distill_messages(text: str, system: str | None) -> list[Message]:
             msgs = []
             if system:
                 msgs.append(Message("system", system))
             msgs.append(Message("user", text))
+            return msgs
+
+        def _record_distillation(text: str, msgs: list[Message], resp) -> str:
+            # Meter + channel are NOT thread-safe, so recording/emitting always
+            # happens on the main thread (after any concurrent calls return).
             before = meter.total_tokens
-            resp = self.client.complete(msgs, model=self.model)
-            # A flat sub-call still spends tokens; fold it into the shared total.
             meter.record(resp.usage, sent_messages=msgs, response_text=resp.content)
             out = resp.content or ""
             channel.emit(Step(
@@ -320,12 +446,64 @@ class RLMEngine:
             ))
             return out
 
-        def rlm(sub_question: str, paths: list[str] | None = None) -> str:
+        def llm(text: str, system: str | None = None) -> str:
+            if meter.exhausted:
+                return _BUDGET_NOTICE
+            msgs = _distill_messages(text, system)
+            resp = self.client.complete(msgs, model=self.model)
+            # A flat sub-call still spends tokens; fold it into the shared total.
+            return _record_distillation(text, msgs, resp)
+
+        def llm_batched(texts, system: str | None = None) -> list[str]:
+            # Partition + map: run many flat distillations CONCURRENTLY and return
+            # their results in input order. The dominant RLM pattern (chunk the
+            # data, distill every chunk) is embarrassingly parallel — doing it
+            # serially is the latency cost the reference RLM work calls out.
+            texts = list(texts)
+            if not texts:
+                return []
+            if meter.exhausted:
+                return [_BUDGET_NOTICE] * len(texts)
+
+            def _call(t: str):
+                try:
+                    msgs = _distill_messages(t, system)
+                    return msgs, self.client.complete(msgs, model=self.model), None
+                except Exception as e:  # one failure must not sink the batch
+                    return _distill_messages(t, system), None, e
+
+            workers = max(1, min(len(texts), self.max_parallel_calls))
+            slots: list = [None] * len(texts)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_call, t): i for i, t in enumerate(texts)}
+                for fut in as_completed(futs):
+                    slots[futs[fut]] = fut.result()
+
+            # Record + emit sequentially on the main thread, in input order.
+            outs: list[str] = []
+            for t, (msgs, resp, err) in zip(texts, slots):
+                if err is not None:
+                    out = f"[llm error: {err}]"
+                    channel.emit(Step(
+                        depth=depth, index=current["index"],
+                        llm_call=LLMCall(prompt=t, response=out, tokens=0),
+                    ))
+                else:
+                    out = _record_distillation(t, msgs, resp)
+                outs.append(out)
+            return outs
+
+        def rlm(sub_question: str, scope=None, paths=None) -> str:
+            if meter.exhausted:
+                return _BUDGET_NOTICE
             if depth + 1 > self.max_depth:
                 # Out of recursion budget: degrade to a flat call so we still
                 # make progress instead of failing.
                 return llm(sub_question)
-            sub_corpus = corpus.subset(paths) if paths else corpus
+            # `paths` is the legacy corpus-only alias for `scope`; the selector's
+            # meaning is the source's (file paths, doc indices, a char range).
+            sel = scope if scope is not None else paths
+            sub_source = source.subset(sel) if sel is not None else source
 
             # The sub-agent can call ask_parent(...) to consult us. We're
             # suspended inside execute() while it runs, so we answer with a
@@ -346,7 +524,7 @@ class RLMEngine:
 
             return self.run(
                 sub_question,
-                sub_corpus,
+                sub_source,
                 depth=depth + 1,
                 channel=channel,
                 meter=meter,
@@ -355,8 +533,9 @@ class RLMEngine:
                 planning_root_only=planning_root_only,
             )
 
-        names = dict(corpus=corpus, llm=llm, rlm=rlm, answer=answer)
-        system_prompt = SYSTEM_PROMPT
+        names = {source.repl_name: source, "llm": llm, "llm_batched": llm_batched,
+                 "rlm": rlm, "answer": answer}
+        system_prompt = build_system_prompt(source, extra=self.extra_instructions)
         planning_here = enable_planning and (not planning_root_only or depth == 0)
         if planning_here:
             system_prompt += PLANNING_PROMPT
@@ -394,6 +573,12 @@ class RLMEngine:
 
         for i in range(self.max_steps):
             current["index"] = i
+            # Global budget guard (shared meter => spans the whole run tree).
+            # Stop before another model call rather than running away on cost.
+            if meter.exhausted:
+                channel.emit(Step(depth=depth, index=i,
+                                  note="budget exhausted — stopping before further model calls"))
+                break
             resp = self.client.complete(messages, tools=[PYTHON_TOOL], model=self.model)
             # Record before appending the reply: `messages` is exactly the
             # context we just sent, so its size is this step's context gauge.
@@ -417,7 +602,7 @@ class RLMEngine:
                 final = resp.content or holder.get("value", "")
                 channel.emit(Step(depth=depth, index=i, final=final))
                 _save_transcript()
-                return final
+                return _finish(final)
 
             for tc in resp.tool_calls:
                 code = tc.arguments.get("code", "")
@@ -427,6 +612,9 @@ class RLMEngine:
                 if result.error:
                     output = (output + "\n" if output else "") + result.error
                 output = output.strip() or "(no output)"
+                # Cap before it enters context (and before we emit it, so the
+                # trace shows exactly what the model saw).
+                output = truncate_output(output, self.max_output_chars)
                 channel.emit(Step(depth=depth, index=i, output=output))
                 messages.append(
                     Message("tool", content=output, tool_call_id=tc.id)
@@ -441,7 +629,7 @@ class RLMEngine:
             if "value" in holder:
                 channel.emit(Step(depth=depth, index=i, final=holder["value"]))
                 _save_transcript()
-                return holder["value"]
+                return _finish(holder["value"])
 
             # Compaction check. `context_tokens` is the authoritative size of
             # what we just sent; project this step's appended output on top so a
@@ -477,6 +665,9 @@ class RLMEngine:
                             ),
                         ))
 
-        # Ran out of steps — return whatever we have.
+        # Ran out of steps (or budget) — return whatever we have.
         _save_transcript()
-        return holder.get("value") or "Stopped: reached max steps without a final answer."
+        if "value" in holder:
+            return _finish(holder["value"])
+        reason = "budget exhausted" if meter.exhausted else "reached max steps"
+        return _finish(f"Stopped: {reason} without a final answer.")

@@ -56,7 +56,7 @@ _END = object()
 def _event_type(step: Step) -> str:
     """A discriminator the client can switch on (the SSE `event:` name)."""
     for name in ("compaction", "usage", "message", "code", "llm_call",
-                 "output", "interaction", "todo", "final"):
+                 "output", "interaction", "todo", "note", "final"):
         if getattr(step, name) is not None:
             return name
     return "event"
@@ -116,10 +116,14 @@ class RunManager:
 
     def __init__(self, corpus: Corpus, engine: RLMEngine,
                  pool: SessionEnvPool | None = None,
-                 *, max_concurrent_runs: int = 0):
+                 *, max_concurrent_runs: int = 0,
+                 max_total_tokens: int = 0, max_total_calls: int = 0):
         self.corpus = corpus
         self.engine = engine
         self._pool = pool
+        # Per-run global budget (rides on each run's UsageMeter).
+        self._max_total_tokens = max_total_tokens
+        self._max_total_calls = max_total_calls
         self._sessions: dict[str, Session] = {}
         self._history: dict[tuple[str, str], list[Message]] = {}
         self._lock = threading.Lock()
@@ -179,7 +183,10 @@ class RunManager:
              enable_planning: bool | None = None,
              planning_root_only: bool | None = None) -> None:
         channel = SSEChannel(session.events, session.replies)
-        meter = UsageMeter()
+        meter = UsageMeter(
+            max_total_tokens=self._max_total_tokens,
+            max_total_calls=self._max_total_calls,
+        )
         transcript: list[Message] = []
         try:
             # A pooled, persistent env (when configured) keeps this session's
@@ -357,6 +364,8 @@ def build_manager(settings: Settings, data: str) -> RunManager:
         model=settings.model,
         max_steps=settings.max_steps,
         max_depth=settings.max_depth,
+        max_output_chars=settings.max_output_chars,
+        max_parallel_calls=settings.max_parallel_calls,
         compactor=compactor,
         enable_planning=settings.enable_planning,
         planning_root_only=settings.planning_root_only,
@@ -366,7 +375,9 @@ def build_manager(settings: Settings, data: str) -> RunManager:
     # Persistent per-session envs so follow-ups resume variables + workspace.
     pool = build_session_pool(settings)
     return RunManager(corpus, engine, pool,
-                      max_concurrent_runs=settings.max_concurrent_runs)
+                      max_concurrent_runs=settings.max_concurrent_runs,
+                      max_total_tokens=settings.max_total_tokens,
+                      max_total_calls=settings.max_total_calls)
 
 
 def serve(data: str, host: str = "127.0.0.1", port: int = 8000,

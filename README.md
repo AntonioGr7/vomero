@@ -317,9 +317,73 @@ how to run it **safely** as a microservice (including on Kubernetes): see
 > sandbox (`VOMERO_SANDBOX=1`): by default the model's code runs in-process
 > with `exec`.
 
+## Two data modes: folder or in-memory context
+
+The model navigates a **`Source`** ([src/vomero/context/source.py](src/vomero/context/source.py)) — either:
+
+- **`Corpus`** — a folder of files on disk (`vomero ask "…" --data ./folder`); or
+- **`Context`** — an in-memory blob (a string, or a list of documents) held as a
+  REPL **variable**. This is the canonical Recursive-Language-Model surface: the
+  context *itself* lives as a variable the model greps/slices/chunks, never
+  pasted into its own token window. Mount one with `--text PATH` (or `--text -`
+  to read it from stdin):
+
+```bash
+vomero ask "Summarize the key risks." --text ./long_contract.txt
+cat huge_transcript.txt | vomero ask "Who decided to ship after auth landed?" --text -
+```
+
+Both satisfy the same seam, so recursion, compaction, planning, and the sandbox
+work identically over either. The REPL exposes `corpus`/`context` accordingly,
+plus `llm()`, `llm_batched()` (parallel partition+map), `rlm()`, and `answer()`.
+
+## Budgets & output caps
+
+- **Global budget across the whole run tree** — `--max-total-tokens` /
+  `--max-total-calls` (or `VOMERO_MAX_TOTAL_TOKENS` / `…_CALLS`) cap total spend
+  across the root loop and every recursive sub-call. When a limit is hit the run
+  stops spawning work and returns its best effort.
+- **Per-result output cap** — `--max-output-chars` (default 10k) head/tail-
+  truncates any single tool result before it enters the transcript, so one
+  oversized `print` can't permanently bloat the protected recent tail.
+- **Unbounded answers** — `answer(var)` records the *full* contents of a REPL
+  variable, so a long answer assembled programmatically isn't limited by the
+  model's output size.
+
+## Evaluating (RLM vs. a stuff-the-context baseline)
+
+`vomero eval` measures correctness (exact-match / token-F1 / contains / optional
+LLM-judge) and cost (tokens, latency) against a one-shot baseline that pastes the
+whole context into a single prompt — the long-context control RLM has to beat:
+
+```bash
+# MultiHopRAG (after data/download_corpus.py + downloading MultiHopRAG.json):
+vomero eval --benchmark multihoprag --limit 50 --mode both --judge
+
+# Or any JSONL of {question, answer, context} rows:
+vomero eval --jsonl my_qa.jsonl --mode both
+```
+
+See [src/vomero/eval/](src/vomero/eval/) — adapters, runners, and metrics.
+
+## Tuning the prompt to a metric (instead of hand-writing it)
+
+`run(..., return_trajectory=True)` returns a `RunResult` (answer + per-step
+trajectory + cost) for inspection. On top of that, a native prompt optimizer
+([src/vomero/eval/optimize.py](src/vomero/eval/optimize.py)) searches candidate
+instruction blocks (the engine's `extra_instructions`) and keeps the one that
+maximizes an eval metric on a train set — the DSPy idea (a *measured* prompt),
+built on the eval harness above with no extra dependency:
+
+```python
+from vomero.eval import optimize, propose_instructions, load_jsonl
+cands = [None] + propose_instructions(client, n=4)      # baseline + model-proposed
+result = optimize(engine, train_items, cands, metric="f1", judge_client=client)
+print(result.summary())   # engine is left configured with the winning block
+```
+
 ## Roadmap (next)
 
-- Output truncation at the `execute` boundary (a single oversized tool result
-  can't be reclaimed by compaction — it stays in the protected tail).
-- Binary/large-file handling (PDF, parquet) via lazy adapters on `corpus`.
+- Binary/large-file handling (PDF, parquet) via lazy adapters on the source.
 - Caching of `llm()`/`rlm()` sub-answers to cut cost on repeated sub-questions.
+- Prompt/prefix caching at the provider client to cut per-step cost.

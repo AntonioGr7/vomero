@@ -71,16 +71,35 @@ class UsageSnapshot:
 
 @dataclass
 class UsageMeter:
-    """Accumulates token usage across an entire `run` tree (shared via recursion)."""
+    """Accumulates token usage across an entire `run` tree (shared via recursion).
+
+    Because one meter is threaded through the root loop and every recursive
+    `llm()`/`rlm()` sub-call, the optional budget below is inherently *global*
+    across the whole recursion tree — the single lever the reference RLM work
+    names as missing ("no strong guarantees on total API cost or runtime"). Both
+    limits default to 0 = unlimited, preserving prior behavior.
+    """
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     calls: int = 0
     estimated: bool = False
+    # Hard ceilings across the whole run tree (0 = unlimited).
+    max_total_tokens: int = 0
+    max_total_calls: int = 0
 
     @property
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
+
+    @property
+    def exhausted(self) -> bool:
+        """True once any configured budget is met or exceeded. The engine stops
+        spawning work and returns its best effort instead of running away."""
+        return (
+            (self.max_total_tokens > 0 and self.total_tokens >= self.max_total_tokens)
+            or (self.max_total_calls > 0 and self.calls >= self.max_total_calls)
+        )
 
     def record(
         self,

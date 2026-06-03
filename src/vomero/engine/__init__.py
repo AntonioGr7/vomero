@@ -3,6 +3,6 @@
 from __future__ import annotations
 
 from .compaction import Compactor
-from .rlm import RLMEngine
+from .rlm import RLMEngine, RunResult
 
-__all__ = ["RLMEngine", "Compactor"]
+__all__ = ["RLMEngine", "Compactor", "RunResult"]
