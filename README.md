@@ -28,13 +28,12 @@ sub-corpus), and `answer()`.
 
 ```
 src/vomero/
-  llm/        provider-agnostic client (base protocol + OpenAI impl)   [ADR 0002]
-  execution/  swappable execution backend: in-process + gVisor sandbox [ADR 0001/0004]
+  llm/        provider-agnostic client (base protocol + OpenAI impl)
+  execution/  swappable execution backend: in-process + gVisor sandbox
   context/    Corpus — lazy navigable view over the data folder
   engine/     RLMEngine — the recursive REPL loop  + system prompt
   config.py   env-driven settings
   cli.py      `vomero ask`
-docs/adr/     architecture decisions (provider swap, sandbox swap)
 examples/sample_corpus/   tiny interlinked demo data for multi-hop
 tests/        runs without an API key (scripted fake client)
 ```
@@ -68,14 +67,14 @@ uv run pytest        # no API key required
 - **Backend:** OpenAI-compatible (works with OpenAI and any compatible server —
   vLLM, LM Studio, OpenRouter, local) and **Gemini** (`VOMERO_PROVIDER=gemini`,
   via its OpenAI-compatible endpoint). Anthropic slots in behind the same
-  `LLMClient` protocol — see [ADR 0002](docs/adr/0002-model-provider-abstraction.md).
+  `LLMClient` protocol.
 - **Execution:** two backends behind one `ExecutionEnvironment` seam.
   - *in-process* `exec` (default) — fast, full-power, **not sandboxed**; for
-    trusted local/dev use. See [ADR 0001](docs/adr/0001-execution-environment.md).
+    trusted local/dev use.
   - *gVisor sandbox* (opt-in) — runs each step in a `runsc` container with hard
     memory/CPU caps, no network, read-only corpus, non-root, no host filesystem
     access. The host-stateful helpers (`llm`/`rlm`/`answer`/…) stay available
-    via an RPC surface. See [ADR 0004](docs/adr/0004-gvisor-sandbox.md).
+    via an RPC surface.
 
 ### Sandboxed execution (gVisor)
 
@@ -173,8 +172,7 @@ Per run:
    isolated container.
 
 > Exceeding `--sandbox-memory` OOM-kills the container mid-run (a hard cap, by
-> design); the step returns a clear error. Full design in
-> [ADR 0004](docs/adr/0004-gvisor-sandbox.md).
+> design); the step returns a clear error.
 
 ## Token accounting
 
@@ -196,8 +194,7 @@ char-based estimate, flagged with `~`. Read totals programmatically off
 
 When projected context crosses `--compact-ratio` of `--context-window` (default
 0.8 of 128k), the loop summarizes the *middle* of the transcript and continues —
-the context gauge above visibly drops. The design (see
-[ADR 0003](docs/adr/0003-context-compaction.md)):
+the context gauge above visibly drops. The design:
 
 - **preamble + recent tail kept verbatim**; only the middle is summarized, and
   the tail boundary is snapped so it never orphans a tool result;
@@ -317,14 +314,12 @@ how to run it **safely** as a microservice (including on Kubernetes): see
 **[docs/deployment.md](docs/deployment.md)**.
 
 > Before exposing this to a browser on untrusted input, turn on the gVisor
-> sandbox (`VOMERO_SANDBOX=1`, [ADR 0004](docs/adr/0004-gvisor-sandbox.md)): by
-> default the model's code runs in-process with `exec`.
+> sandbox (`VOMERO_SANDBOX=1`): by default the model's code runs in-process
+> with `exec`.
 
 ## Roadmap (next)
 
-- Interactive `vomero chat` (multi-turn, persistent REPL across questions).
 - Output truncation at the `execute` boundary (a single oversized tool result
   can't be reclaimed by compaction — it stays in the protected tail).
 - Binary/large-file handling (PDF, parquet) via lazy adapters on `corpus`.
-- Sandbox: a warm container pool to cut per-run startup latency (ADR 0004).
 - Caching of `llm()`/`rlm()` sub-answers to cut cost on repeated sub-questions.

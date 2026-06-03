@@ -2,8 +2,7 @@
 
 Implements the same `inject(**names)` + `execute(code) -> ExecResult` contract
 as `InProcessEnvironment`, but runs the model's code inside a gVisor container
-instead of this process. See docs/adr/0001 (the seam) and docs/adr/0004 (this
-design).
+instead of this process.
 
 Shape of one run:
 

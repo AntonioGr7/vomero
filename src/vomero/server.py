@@ -27,7 +27,7 @@ UsageMeter and REPL; `ask_user` blocks that thread until a reply POST arrives.
 Stdlib only — this is a reference/dev server. For production put a real ASGI
 framework in front (the Channel/threading shape is identical), add auth, request
 limits, cancellation, and — critically — a sandboxed ExecutionEnvironment: this
-runs model-authored code in-process with `exec` (see ADR 0001).
+runs model-authored code in-process with `exec`.
 """
 
 from __future__ import annotations
@@ -107,37 +107,62 @@ class RunManager:
     Together: `_history` restores the conversation, `_pool` restores the live
     state. Both are in-process here; back them with SQLite/Redis + a durable
     workspace volume for restart survival.
+
+    Admission control: `max_concurrent_runs` caps in-flight runs per replica via
+    a semaphore. Over the cap, `start()` returns None and the handler replies
+    HTTP 429 — graceful backpressure instead of unbounded threads/containers and
+    an eventual OOM. 0 = unlimited (the default).
     """
 
     def __init__(self, corpus: Corpus, engine: RLMEngine,
-                 pool: SessionEnvPool | None = None):
+                 pool: SessionEnvPool | None = None,
+                 *, max_concurrent_runs: int = 0):
         self.corpus = corpus
         self.engine = engine
         self._pool = pool
         self._sessions: dict[str, Session] = {}
         self._history: dict[tuple[str, str], list[Message]] = {}
         self._lock = threading.Lock()
+        # Bounded so a balanced acquire/release can't over-release; None when
+        # unlimited. A permit is held for a run's whole lifetime (incl. time
+        # blocked in ask_user), since that's exactly when it holds a container.
+        self._runs = (
+            threading.BoundedSemaphore(max_concurrent_runs)
+            if max_concurrent_runs > 0 else None
+        )
 
     def start(self, question: str, *, user_id: str = "anonymous",
               session_id: str | None = None,
               enable_planning: bool | None = None,
-              planning_root_only: bool | None = None) -> Session:
-        # A new conversation gets a fresh session_id; passing back a known
-        # (user_id, session_id) continues that conversation.
-        session_id = session_id or uuid.uuid4().hex
-        key = (user_id, session_id)
-        with self._lock:
-            # Seed with a copy of the stored transcript (None on first turn).
-            history = list(self._history.get(key, []))
-            session = Session(session_id)
-            self._sessions[session_id] = session
-        threading.Thread(
-            target=self._run, args=(session, question, key, history),
-            kwargs={"enable_planning": enable_planning,
-                    "planning_root_only": planning_root_only},
-            daemon=True,
-        ).start()
-        return session
+              planning_root_only: bool | None = None) -> Session | None:
+        # Admission control: take a permit up front (non-blocking). None means
+        # we're at capacity — the handler turns that into HTTP 429. The permit
+        # is released in `_run`'s finally (or here if the thread never launches).
+        if self._runs is not None and not self._runs.acquire(blocking=False):
+            return None
+        try:
+            # A new conversation gets a fresh session_id; passing back a known
+            # (user_id, session_id) continues that conversation.
+            session_id = session_id or uuid.uuid4().hex
+            key = (user_id, session_id)
+            with self._lock:
+                # Seed with a copy of the stored transcript (None on first turn).
+                history = list(self._history.get(key, []))
+                session = Session(session_id)
+                self._sessions[session_id] = session
+            threading.Thread(
+                target=self._run, args=(session, question, key, history),
+                kwargs={"enable_planning": enable_planning,
+                        "planning_root_only": planning_root_only},
+                daemon=True,
+            ).start()
+            return session
+        except BaseException:
+            # The run thread never took ownership of the permit; release it so a
+            # failed launch doesn't leak capacity.
+            if self._runs is not None:
+                self._runs.release()
+            raise
 
     def get(self, sid: str) -> Session | None:
         with self._lock:
@@ -194,6 +219,10 @@ class RunManager:
         except Exception as exc:  # surface to the client instead of dying silently
             session.events.put({"type": "error", "error": f"{type(exc).__name__}: {exc}"})
         finally:
+            # Free the admission permit FIRST so capacity recovers immediately,
+            # then close the event stream.
+            if self._runs is not None:
+                self._runs.release()
             session.events.put(_END)
 
 
@@ -210,11 +239,14 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
-    def _json(self, status: int, body: dict) -> None:
+    def _json(self, status: int, body: dict,
+              *, extra_headers: dict[str, str] | None = None) -> None:
         data = json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self._cors()
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -252,6 +284,10 @@ class _Handler(BaseHTTPRequestHandler):
             session = self.manager.start(
                 question, user_id=user_id, session_id=session_id,
                 enable_planning=plan, planning_root_only=plan_root)
+            if session is None:  # at capacity — backpressure, not a crash
+                return self._json(
+                    429, {"error": "server at capacity; retry shortly"},
+                    extra_headers={"Retry-After": "5"})
             return self._json(200, {
                 "session_id": session.id,
                 "events": f"/runs/{session.id}/events",
@@ -329,7 +365,8 @@ def build_manager(settings: Settings, data: str) -> RunManager:
     )
     # Persistent per-session envs so follow-ups resume variables + workspace.
     pool = build_session_pool(settings)
-    return RunManager(corpus, engine, pool)
+    return RunManager(corpus, engine, pool,
+                      max_concurrent_runs=settings.max_concurrent_runs)
 
 
 def serve(data: str, host: str = "127.0.0.1", port: int = 8000,
@@ -352,6 +389,17 @@ def serve(data: str, host: str = "127.0.0.1", port: int = 8000,
     if settings.workspace_root:
         print(f"  ↻ sessions persist: variables for {settings.session_ttl:.0f}s idle, "
               f"workspace under {settings.workspace_root}", file=sys.stderr)
+    caps = []
+    if settings.max_concurrent_runs > 0:
+        caps.append(f"max {settings.max_concurrent_runs} concurrent runs (429 over)")
+    if settings.max_sessions > 0:
+        caps.append(f"max {settings.max_sessions} warm sessions (LRU)")
+    if caps:
+        print("  🚦 limits: " + " · ".join(caps), file=sys.stderr)
+    elif settings.exec_backend == "sandbox":
+        print("  ⚠  no admission limits set (VOMERO_MAX_CONCURRENT_RUNS / "
+              "VOMERO_MAX_SESSIONS) — a load spike can exhaust the node.",
+              file=sys.stderr)
     if settings.exec_backend == "sandbox":
         print(f"\n  🔒 sandbox: gVisor ({settings.sandbox_runtime}), "
               f"mem={settings.sandbox_memory} cpus={settings.sandbox_cpus} "
@@ -360,7 +408,7 @@ def serve(data: str, host: str = "127.0.0.1", port: int = 8000,
     else:
         print("\n  ⚠  NOT SANDBOXED: model-authored code runs in-process with exec. "
               "Serve only trusted corpora/users, or set VOMERO_SANDBOX=1 for the "
-              "gVisor backend (ADR 0001/0004).\n",
+              "gVisor backend.\n",
               file=sys.stderr)
     try:
         httpd.serve_forever()

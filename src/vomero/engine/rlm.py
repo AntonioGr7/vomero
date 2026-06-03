@@ -237,7 +237,7 @@ class RLMEngine:
         # the resumable transcript (every message except the rebuilt system
         # prompt) at the end of the run — pass last run's sink as the next run's
         # `history` to chain turns. The engine still keeps no state of its own;
-        # the caller owns the store. See ADR 0004 / server.py.
+        # the caller owns the store. See server.py.
         history: list[Message] | None = None,
         transcript_sink: list[Message] | None = None,
         # Persistent execution environment (root-level; recursion always gets a

@@ -20,7 +20,7 @@ class Settings:
     `provider` selects the LLM backend. Today only "openai" (and any
     OpenAI-compatible server via `base_url`) is implemented, but the engine is
     written against an abstract client so "anthropic"/"gemini" can be added
-    without touching engine code. See docs/adr/0002.
+    without touching engine code.
     """
 
     provider: str = "openai"
@@ -35,7 +35,7 @@ class Settings:
     # Execution backend for the model's code. "inprocess" (default) runs it
     # in-process with `exec` — fast and full-power, but NOT sandboxed; fine for
     # local dev/testing on trusted data. "sandbox" runs each step inside a
-    # gVisor container with hard memory/CPU caps and no network (docs/adr/0004).
+    # gVisor container with hard memory/CPU caps and no network.
     exec_backend: str = "inprocess"
     sandbox_image: str = "python:3.11-slim"
     sandbox_runtime: str = "runsc"      # gVisor; registered with the Docker daemon
@@ -53,6 +53,17 @@ class Settings:
     # even after the variables are reclaimed. None => no warm reuse / workspace.
     workspace_root: str | None = None
     session_ttl: float = 900.0          # 15 min idle before variables are dropped
+
+    # Heavy-load guardrails (server). Both default to 0 = unlimited (prior
+    # behavior); set them in any multi-user deployment so the node fails
+    # gracefully instead of OOMing under load.
+    #  * `max_concurrent_runs` caps in-flight runs per replica; excess POST /runs
+    #    get HTTP 429. Size it to node_mem / per-container-mem — NOT CPU, since
+    #    runs spend most of their wall-clock blocked on the model.
+    #  * `max_sessions` caps the warm/idle session envs the pool keeps alive
+    #    (LRU-evicted past the cap), bounding memory held by idle containers.
+    max_concurrent_runs: int = 0
+    max_sessions: int = 0
 
     # Context / compaction. When the live context size crosses
     # `compact_ratio * context_window`, the middle of the transcript is
@@ -102,6 +113,8 @@ class Settings:
             ),
             workspace_root=os.getenv("VOMERO_WORKSPACE_ROOT") or None,
             session_ttl=float(os.getenv("VOMERO_SESSION_TTL", "900")),
+            max_concurrent_runs=int(os.getenv("VOMERO_MAX_CONCURRENT_RUNS", "0")),
+            max_sessions=int(os.getenv("VOMERO_MAX_SESSIONS", "0")),
             context_window=int(os.getenv("VOMERO_CONTEXT_WINDOW", "128000")),
             compact_ratio=float(os.getenv("VOMERO_COMPACT_RATIO", "0.8")),
             compact_keep_recent=int(os.getenv("VOMERO_COMPACT_KEEP_RECENT", "6")),

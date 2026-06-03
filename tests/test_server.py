@@ -7,6 +7,7 @@ the reply endpoint, and the final answer + usage arrive.
 
 import json
 import threading
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -45,6 +46,19 @@ def _post(url, body):
     )
     with urllib.request.urlopen(req) as r:
         return json.loads(r.read())
+
+
+def _post_status(url, body):
+    """POST and return (status, body, headers) without raising on 4xx/5xx."""
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, json.loads(r.read()), dict(r.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}"), dict(e.headers)
 
 
 def _read_sse(url, on_event, stop_type="end"):
@@ -153,6 +167,47 @@ def test_server_resumes_conversation_for_follow_up():
         assert final2 == "P-ATLAS owns it."
     finally:
         shutdown()
+
+
+def test_server_returns_429_when_at_capacity():
+    """With max_concurrent_runs=1, a second run started while the first is still
+    in flight (blocked in ask_user, holding the only permit) gets HTTP 429."""
+    script = [
+        _py("1", "x = ask_user('hold'); print(x)"),  # run 1 blocks here
+        _py("2", "answer('done')"),                   # ...resumes after the reply
+        _py("3", "answer('ok3')"),                    # the post-recovery run (go3)
+    ]
+    engine = RLMEngine(FakeClient(script), enable_interaction=True)
+    manager = RunManager(Corpus(CORPUS), engine, max_concurrent_runs=1)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    httpd.manager = manager
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    try:
+        started = _post(f"{base}/runs", {"question": "go"})
+        asked = threading.Event()
+        rejected: dict = {}
+
+        def on_event(etype, data):
+            if etype == "ask_user" and not asked.is_set():
+                asked.set()
+                # Run 1 now holds the only permit -> this must be refused.
+                status, _, headers = _post_status(f"{base}/runs", {"question": "go2"})
+                rejected["status"] = status
+                rejected["retry_after"] = headers.get("Retry-After")
+                # Release run 1 so its stream (and this read) can finish.
+                _post(f"{base}{started['reply']}", {"answer": "ok"})
+
+        _read_sse(f"{base}{started['events']}", on_event)
+        assert rejected["status"] == 429
+        assert rejected["retry_after"] == "5"
+
+        # Capacity recovered: a fresh run is admitted again (permit released).
+        status2, _, _ = _post_status(f"{base}/runs", {"question": "go3"})
+        assert status2 == 200
+    finally:
+        httpd.shutdown()
 
 
 def test_server_streams_events_and_round_trips_ask_user():

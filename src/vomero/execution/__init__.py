@@ -2,8 +2,7 @@
 
 The engine depends only on the `ExecutionEnvironment` ABC. The default backend
 is in-process `exec` (fast, full-power, NOT sandboxed). An optional gVisor
-sandbox (`sandbox/`) implements the same interface with real isolation. See
-docs/adr/0001 for the seam and docs/adr/0004 for the sandbox design.
+sandbox (`sandbox/`) implements the same interface with real isolation.
 
 `build_env_factory(settings)` is the single place that picks a backend from
 config, so the CLI and server stay identical.

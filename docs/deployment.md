@@ -234,7 +234,9 @@ A `.env` file in the working directory is loaded automatically.
 | Variable | Default | What it does |
 |---|---|---|
 | `VOMERO_WORKSPACE_ROOT` | — | host dir for per-session writable workspaces; unset = no durable files |
-| `VOMERO_SESSION_TTL` | `900` | seconds of idle before a session's variables are dropped |
+| `VOMERO_SESSION_TTL` | `900` | seconds of idle before a session's variables are dropped (lower to 120–300 under load) |
+| `VOMERO_MAX_CONCURRENT_RUNS` | `0` (unlimited) | in-flight runs per replica; excess `POST /runs` get **HTTP 429**. Size to `node_mem / per-container-mem`, not CPU |
+| `VOMERO_MAX_SESSIONS` | `0` (unlimited) | warm/idle session envs the pool keeps; LRU-evicted past the cap (bounds memory held by idle containers) |
 
 ### Behaviour toggles
 
@@ -660,6 +662,13 @@ read-only rootfs, dropped caps, `NetworkPolicy`, resource limits, secrets).
 
 ### Scheduling / scaling notes specific to Vomero
 
+- **Cap load per replica, or a spike OOMs the node.** Each run holds a
+  container (and recursion spawns more), and warm session envs linger for
+  `VOMERO_SESSION_TTL`. Set **`VOMERO_MAX_CONCURRENT_RUNS`** (in-flight runs →
+  HTTP 429 over the cap) and **`VOMERO_MAX_SESSIONS`** (warm envs → LRU-evicted
+  over the cap). Size `MAX_CONCURRENT_RUNS` to `node_mem / per-container-mem`,
+  **not** CPU — runs spend most of their wall-clock blocked on the model. A 429
+  is the signal for the HPA/load balancer to add or pick another replica.
 - **Sessions are per-replica and in-memory.** Conversation history
   (`transcript_sink`/`history`) and the `SessionEnvPool` (variables, warm
   sandboxes) live in the replica that handled the turn. For multi-replica

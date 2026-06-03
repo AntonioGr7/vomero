@@ -1,7 +1,7 @@
 """Per-session environment reuse — durable variables + workspace across turns.
 
 By default every `engine.run()` builds a fresh `ExecutionEnvironment` and throws
-it away, so nothing survives between interactions (ADR 0004). `SessionEnvPool`
+it away, so nothing survives between interactions. `SessionEnvPool`
 keeps ONE environment alive per `(user_id, session_id)` so a follow-up resumes
 the model's live REPL variables and its workspace files — the engine's `env=`
 override hands the pooled env back into the loop.
@@ -20,6 +20,13 @@ Concurrency: one env per session is a single namespace/container, so turns of
 the same session must not run concurrently. `session()` hands out a per-session
 lock; eviction skips a session whose lock is held, so a long run is never torn
 down from under itself.
+
+Heavy-load bound: `max_sessions` caps how many warm envs the pool keeps. When a
+new session would exceed it, the least-recently-used IDLE env is closed to make
+room (LRU). In-flight sessions are never evicted, so a burst of active runs can
+briefly exceed the cap — the *server's* concurrency semaphore bounds active
+load; this cap bounds the memory held by warm/idle containers between turns.
+0 = unlimited (the default).
 """
 
 from __future__ import annotations
@@ -71,12 +78,15 @@ class SessionEnvPool:
         *,
         ttl_seconds: float = 900.0,
         workspace_root: str | None = None,
+        max_sessions: int = 0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         # make_env(key, workspace_path|None) -> a fresh environment.
         self._make_env = make_env
         self._ttl = ttl_seconds
         self._workspace_root = workspace_root
+        # Max warm envs kept alive; 0 = unlimited. LRU-evicted past this cap.
+        self._max_sessions = max_sessions
         self._clock = clock
         self._entries: dict[SessionKey, _Entry] = {}
         self._lock = threading.Lock()
@@ -114,10 +124,26 @@ class SessionEnvPool:
             self._evict_expired(now)
             entry = self._entries.get(key)
             if entry is None:
+                if self._max_sessions:
+                    self._evict_lru_over_cap()
                 env = self._make_env(key, self.workspace_for(key))
                 entry = _Entry(env=env, last_used=now)
                 self._entries[key] = entry
             return entry
+
+    def _evict_lru_over_cap(self) -> None:
+        """Make room for one new session by closing the least-recently-used IDLE
+        env while at/over `max_sessions`. Caller holds `self._lock`. Sessions
+        with a run in flight (lock held) are never evicted, so the cap may be
+        transiently exceeded under a burst of active runs."""
+        while len(self._entries) >= self._max_sessions:
+            idle = [(e.last_used, k) for k, e in self._entries.items()
+                    if not e.lock.locked()]
+            if not idle:
+                return  # everything is in use; let the new env push us over
+            _, key = min(idle)
+            entry = self._entries.pop(key)
+            _close(entry.env)
 
     # -- eviction / lifecycle -------------------------------------------
 
@@ -211,4 +237,7 @@ def build_session_pool(
             )
             return SandboxEnvironment(config)
 
-    return SessionEnvPool(make_env, ttl_seconds=ttl, workspace_root=root)
+    return SessionEnvPool(
+        make_env, ttl_seconds=ttl, workspace_root=root,
+        max_sessions=getattr(settings, "max_sessions", 0),
+    )

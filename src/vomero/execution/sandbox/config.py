@@ -25,7 +25,7 @@ class SandboxConfig:
     image: str = "python:3.11-slim"
 
     # The OCI runtime. "runsc" is gVisor; must be registered with the Docker
-    # daemon (see docs/adr/0004). Set to "runc" to test the plumbing without
+    # daemon. Set to "runc" to test the plumbing without
     # gVisor isolation (NOT recommended for untrusted code).
     runtime: str = "runsc"
 

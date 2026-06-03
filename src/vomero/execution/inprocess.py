@@ -3,7 +3,7 @@
 Runs the model's code with `exec` in a persistent dict namespace, capturing
 stdout+stderr. NOT sandboxed: the code can touch the filesystem and import
 anything. That is acceptable for a personal, trusted tool and is the explicit
-v0 trade-off (docs/adr/0001). The `ExecutionEnvironment` interface is the seam
+v0 trade-off. The `ExecutionEnvironment` interface is the seam
 where a real sandbox slots in later.
 """
 

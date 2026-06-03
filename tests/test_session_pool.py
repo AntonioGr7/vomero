@@ -142,6 +142,46 @@ def test_pool_reuses_within_ttl_then_evicts_after():
     assert created[0].closed is True            # the evicted env was closed
 
 
+def test_pool_evicts_lru_when_over_max_sessions():
+    created: list[_FakeEnv] = []
+
+    def make_env(key, workspace):
+        env = _FakeEnv(workspace)
+        created.append(env)
+        return env
+
+    clock = {"t": 0.0}
+    pool = SessionEnvPool(make_env, ttl_seconds=1e9, max_sessions=2,
+                          clock=lambda: clock["t"])
+
+    # Touch s1 then s2; both warm (cap=2).
+    clock["t"] = 1.0
+    with pool.session(("u", "s1")):
+        pass
+    clock["t"] = 2.0
+    with pool.session(("u", "s2")):
+        pass
+    # Re-touch s1 so s2 is now the least-recently-used.
+    clock["t"] = 3.0
+    with pool.session(("u", "s1")):
+        pass
+
+    # A third distinct session exceeds the cap -> the LRU idle env (s2) is closed.
+    clock["t"] = 4.0
+    with pool.session(("u", "s3")):
+        pass
+
+    assert len(created) == 3
+    assert created[1].closed is True   # s2 (LRU) was evicted
+    assert created[0].closed is False  # s1 (recently used) survived
+
+    # s2 must be rebuilt on next use (it was evicted, not reused).
+    clock["t"] = 5.0
+    with pool.session(("u", "s2")):
+        pass
+    assert len(created) == 4
+
+
 def test_pool_workspace_dir_persists_until_discarded(tmp_path):
     pool = SessionEnvPool(lambda key, ws: _FakeEnv(ws), workspace_root=str(tmp_path))
     key = ("u1", "s1")

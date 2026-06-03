@@ -16,8 +16,8 @@ The server is bound to **one corpus** (chosen at startup) so clients never send
 filesystem paths. It reads model/provider/keys from the environment like
 `vomero ask` (see `.env.example`).
 
-> ⚠ **Not sandboxed.** Model-authored code runs in-process with `exec`
-> (ADR 0001). Serve only trusted corpora and trusted clients until a sandboxed
+> ⚠ **Not sandboxed.** Model-authored code runs in-process with `exec`.
+> Serve only trusted corpora and trusted clients until a sandboxed
 > `ExecutionEnvironment` lands. Don't expose this to the open internet as-is.
 
 ## Protocol
