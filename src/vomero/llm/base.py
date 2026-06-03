@@ -18,6 +18,11 @@ class ToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
+    # Opaque provider passthrough echoed back verbatim when this tool call is
+    # replayed in history. Gemini 3 returns a `thought_signature` here that it
+    # *requires* on every prior function call, or the next request 400s. Unused
+    # by OpenAI. Kept wire-neutral: the engine never inspects it.
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

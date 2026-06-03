@@ -33,4 +33,11 @@ class GeminiClient(OpenAIClient):
             model=model,
             base_url=base_url or GEMINI_OPENAI_BASE,
             api_key=api_key,
+            # Gemini 2.5's OpenAI-compat function calling is brittle with
+            # `tool_choice="auto"`: it routinely returns an empty reply with
+            # finish_reason=MALFORMED_FUNCTION_CALL, which the engine reads as a
+            # (blank) final answer. Forcing the single `python` tool makes it
+            # call the tool reliably. The RLM loop still finishes via the
+            # `answer(...)` call inside the REPL, so forcing tool use is safe.
+            force_single_tool=True,
         )
