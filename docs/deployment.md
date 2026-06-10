@@ -244,10 +244,21 @@ A `.env` file in the working directory is loaded automatically.
 
 ### Execution backend (the security-critical knob)
 
+`VOMERO_EXEC_BACKEND` picks how the model's **REPL code** is isolated:
+
+| Value | Where code runs | Isolation | Needs |
+|---|---|---|---|
+| `inprocess` (default) | on the machine, via `exec()` | **none** — fast, full-power | nothing |
+| `gvisor` | each REPL step in a gVisor container | per-step kernel sandbox | Docker + the `runsc` runtime |
+
+Legacy `VOMERO_SANDBOX=1` maps to `gvisor` when `VOMERO_EXEC_BACKEND` is unset.
+On the CLI: `vomero ask --exec-backend {inprocess,gvisor}`.
+
+**`gvisor` knobs** (the model's whole snippet runs in the container; host helpers
+are bridged back over RPC):
+
 | Variable | Default | What it does |
 |---|---|---|
-| `VOMERO_SANDBOX=1` | off | shortcut for `VOMERO_EXEC_BACKEND=sandbox` |
-| `VOMERO_EXEC_BACKEND` | `inprocess` | `inprocess` (fast, **not isolated**) or `sandbox` (gVisor) |
 | `VOMERO_SANDBOX_IMAGE` | `python:3.11-slim` | container image (point at one with your deps) |
 | `VOMERO_SANDBOX_RUNTIME` | `runsc` | OCI runtime (gVisor) |
 | `VOMERO_SANDBOX_MEMORY` | `512m` | hard memory cap (e.g. `1g`) |
@@ -255,6 +266,40 @@ A `.env` file in the working directory is loaded automatically.
 | `VOMERO_SANDBOX_NETWORK` | `none` | docker `--network`; keep `none` |
 | `VOMERO_SANDBOX_PIDS` | `256` | max processes (fork-bomb guard) |
 | `VOMERO_SANDBOX_STARTUP_TIMEOUT` | `60` | seconds to wait for the container (first run pulls the image) |
+
+### Sandboxed runner — the whole engine in a pod (heavy-load topology)
+
+A different shape from the exec backends above: instead of isolating *snippets*,
+you run the **entire engine inside a hardened Kubernetes pod**, and the host
+becomes a thin **dispatcher**. Each request leases a warm worker pod (from the
+[`vomero_sandbox`](https://github.com/AntonioGr7/vomero_sandbox) pool), uploads
+the corpus, and runs `vomero ask` in the pod — corpus navigation, `llm`/`rlm`/
+`answer`, and the model's code all execute there. The pod reaches the LLM through
+the cluster's egress. Because the host never runs the loop, throughput scales
+with pods/nodes rather than one host process — the right model for heavy,
+multi-tenant load.
+
+Use it via `vomero.sandbox_runner.SandboxedRunner` (see [`main.py`](../main.py)).
+Inside the pod the engine runs `inprocess` (it's already sandboxed). Build the
+worker image with vomero baked in ([`deploy/worker.Dockerfile`](../deploy/worker.Dockerfile))
+and load it into the cluster.
+
+> **Key exposure:** the LLM key is injected per-run into the pod, so it shares the
+> pod with model-generated code. The sandbox protects the host, cluster, and other
+> tenants — lock egress to the LLM endpoint and use per-tenant pods (`max_uses=1`)
+> / scoped keys. A host-side LLM broker (key never enters the pod) is the stronger
+> alternative.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VOMERO_K8S_SANDBOX_IMAGE` | `vomero-worker:latest` | worker image with vomero installed |
+| `VOMERO_K8S_SANDBOX_NAMESPACE` | `sandbox` | Kubernetes namespace for the worker pods |
+| `VOMERO_K8S_SANDBOX_POOL_SIZE` | `3` | warm pods — also the concurrency ceiling |
+| `VOMERO_K8S_SANDBOX_RUNTIME_CLASS` | — | e.g. `gvisor` for kernel isolation (needs cluster-side setup) |
+| `VOMERO_K8S_SANDBOX_TIMEOUT` | `120` | per-request wall-clock seconds (a full run) |
+| `VOMERO_K8S_SANDBOX_EGRESS_PROXY` | — | allowlisting proxy URL; unset = default-deny egress |
+| `VOMERO_K8S_SANDBOX_KUBE_CONTEXT` | — | kubeconfig context; unset = default / in-cluster |
+| `VOMERO_K8S_SANDBOX_MANAGE_NETPOL` | `true` | set `0` (dev/test) to skip the deny-all egress policy so the pod can reach the LLM |
 
 ### Sessions / workspace (server, multi-turn)
 

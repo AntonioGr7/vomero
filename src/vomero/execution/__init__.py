@@ -29,11 +29,13 @@ __all__ = [
 def build_env_factory(settings: Any) -> Callable[[], ExecutionEnvironment]:
     """Map `settings` to an `env_factory` for `RLMEngine`.
 
-    Returns `InProcessEnvironment` unless `settings.exec_backend == "sandbox"`,
+    Returns `InProcessEnvironment` unless `settings.exec_backend == "gvisor"`,
     in which case it returns a thunk that builds a fresh `SandboxEnvironment`
     (one container per run/recursion) from the `sandbox_*` settings. The sandbox
-    module is imported lazily so nothing changes for the default path."""
-    if getattr(settings, "exec_backend", "inprocess") != "sandbox":
+    module is imported lazily so nothing changes for the default path.
+    ("vomero_sandbox" also runs orchestration in-process — its isolation is the
+    `sandbox` surface the engine injects, not a different exec backend.)"""
+    if getattr(settings, "exec_backend", "inprocess") != "gvisor":
         return InProcessEnvironment
 
     from .sandbox import SandboxConfig, SandboxEnvironment

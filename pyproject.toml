@@ -15,6 +15,12 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.6",
 ]
+# Optional: route the model's system-touching ops (shell, code, files) through
+# the vomero_sandbox Kubernetes backend. Enabled with VOMERO_SYSTEM_SANDBOX=1.
+# A sibling module of the vomero ecosystem, kept independently maintained.
+k8s = [
+    "vomero-sandbox @ git+https://github.com/AntonioGr7/vomero_sandbox.git",
+]
 
 [project.scripts]
 vomero = "vomero.cli:main"
@@ -22,6 +28,11 @@ vomero = "vomero.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# The `k8s` extra pulls vomero_sandbox straight from its git repo (a direct
+# reference); hatchling requires this opt-in to allow that.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vomero"]

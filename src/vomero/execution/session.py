@@ -214,7 +214,7 @@ def build_session_pool(
     ttl = ttl_seconds if ttl_seconds is not None else getattr(settings, "session_ttl", 900.0)
     root = workspace_root if workspace_root is not None else getattr(settings, "workspace_root", None)
 
-    if getattr(settings, "exec_backend", "inprocess") != "sandbox":
+    if getattr(settings, "exec_backend", "inprocess") != "gvisor":
         from .inprocess import InProcessEnvironment
 
         def make_env(key: SessionKey, workspace: str | None) -> ExecutionEnvironment:

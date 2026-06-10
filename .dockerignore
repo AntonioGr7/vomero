@@ -1,0 +1,19 @@
+# Keep the Docker build context small: the worker image only needs the package
+# source (pyproject + src), not data, history, envs, or caches.
+.git
+.venv
+data
+examples
+tests
+docs
+deploy
+*.md
+!README.md
+.env
+.env.*
+**/__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+uv.lock
+MultiHopRAG.json

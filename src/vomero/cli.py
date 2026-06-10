@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 from .channel import CallbackChannel
-from .config import Settings
+from .config import Settings, normalize_exec_backend
 from .context import Context, Corpus
 from .engine import Compactor, RLMEngine
 from .engine.rlm import Step
@@ -167,8 +167,10 @@ def cmd_ask(args: argparse.Namespace) -> int:
         settings.enable_interaction = False
     if args.ask_root_only:
         settings.interaction_root_only = True
-    if args.sandbox:
-        settings.exec_backend = "sandbox"
+    if args.exec_backend is not None:
+        settings.exec_backend = normalize_exec_backend(args.exec_backend)
+    elif args.sandbox:  # back-compat alias for --exec-backend gvisor
+        settings.exec_backend = "gvisor"
     if args.sandbox_memory is not None:
         settings.sandbox_memory = args.sandbox_memory
     if args.sandbox_cpus is not None:
@@ -197,10 +199,10 @@ def cmd_ask(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    if settings.exec_backend == "sandbox" and isinstance(source, Context):
-        print("error: --sandbox / VOMERO_SANDBOX supports a folder corpus only; an "
-              "in-memory --text context needs the in-process backend. Drop the "
-              "sandbox flag for context-as-a-variable runs.", file=sys.stderr)
+    if settings.exec_backend == "gvisor" and isinstance(source, Context):
+        print("error: the gVisor backend supports a folder corpus only; an "
+              "in-memory --text context needs the in-process backend. Use "
+              "--exec-backend inprocess for context-as-a-variable runs.", file=sys.stderr)
         return 2
 
     compactor = None
@@ -227,7 +229,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         enable_interaction=settings.enable_interaction,
         interaction_root_only=settings.interaction_root_only,
     )
-    if settings.exec_backend == "sandbox":
+    if settings.exec_backend == "gvisor":
         print(
             f"[sandbox] gVisor backend: image={settings.sandbox_image} "
             f"runtime={settings.sandbox_runtime} "
@@ -292,8 +294,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
     # Eval is a trusted local measurement; default to fast in-process execution.
     # Per-item gVisor containers would be slow, and the sandbox can't mount an
     # in-memory context anyway. Opt back in with --sandbox (folder corpora only).
-    if not args.sandbox:
-        settings.exec_backend = "inprocess"
+    settings.exec_backend = "gvisor" if args.sandbox else "inprocess"
 
     # Load items (each carries the question, gold answer, and its data source).
     try:
@@ -315,7 +316,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    if settings.exec_backend == "sandbox" and any(isinstance(it.source, Context) for it in items):
+    if settings.exec_backend == "gvisor" and any(isinstance(it.source, Context) for it in items):
         print("error: the gVisor sandbox can't mount an in-memory context; run "
               "context/needle evals on the in-process backend (drop --sandbox).",
               file=sys.stderr)
@@ -423,8 +424,15 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Don't let the model ask the user for help (also auto-off when piped).")
     ask.add_argument("--ask-root-only", action="store_true",
                      help="Only the root agent may ask the user; sub-agents consult their parent instead.")
+    ask.add_argument("--exec-backend", default=None,
+                     choices=["inprocess", "gvisor"],
+                     help="How the model's code is isolated: 'inprocess' (on the "
+                          "machine, no isolation) or 'gvisor' (per-step container). "
+                          "Overrides VOMERO_EXEC_BACKEND. (To run the whole engine "
+                          "inside a hardened Kubernetes pod, use the sandboxed "
+                          "runner — see main.py — not this flag.)")
     ask.add_argument("--sandbox", action="store_true",
-                     help="Run the model's code in a gVisor sandbox (isolated, capped) instead of in-process.")
+                     help="Back-compat alias for --exec-backend gvisor.")
     ask.add_argument("--sandbox-memory", default=None,
                      help="Max memory per sandbox container (e.g. 512m, 2g). Default 512m.")
     ask.add_argument("--sandbox-cpus", type=float, default=None,
