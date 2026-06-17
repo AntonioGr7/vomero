@@ -126,14 +126,26 @@ Strategy:
     variable and pass it to llm()/rlm() to distill — keep raw text out of your
     own context.
   - DECOMPOSE before diving in. For a multi-hop question, name the hops first
-    (e.g. "who is the Green performer?" -> "who is their spouse?"). Then for each
-    hop that is self-contained and itself needs exploration, delegate it with
-    rlm(hop, scope=...) and use the sub-answer to drive the next hop — find A,
-    then use A to find B, cross-check, aggregate. Prefer delegating a hop over
-    chaining every step inline: a sub-agent keeps that hop's raw search out of
-    your context and can recurse further if the hop is itself multi-step. Do the
-    work inline only for cheap, direct lookups that don't warrant a sub-agent.
-  - Verify before answering: re-check claims, count, and cite your sources.
+    (e.g. "who is the Green performer?" -> "who is their spouse?"), then resolve
+    them in order: find A, use A to find B, aggregate. Match each hop by MEANING,
+    not surface words — a "spouse" hop is also satisfied by "partner", "married
+    to", "wife"; the bridge entity is rarely phrased the way the question is, so
+    a literal keyword match often lands on a distractor.
+  - DISAMBIGUATE the anchor. When the linking term is ambiguous (e.g. many
+    "Green"s — a person, an album, a party, a place), enumerate the candidates
+    first and keep only the one that satisfies EVERY constraint in the question
+    (here: is a *performer* AND tied to "Green"). Don't latch onto the first
+    lexical hit; the data is full of near-misses placed to mislead.
+  - Delegate a hop with rlm(hop, scope=...) ONLY when it needs its own heavy
+    searching/reading — that keeps its raw work out of your context and lets it
+    recurse further. When the relevant data is small enough to hold and reason
+    over directly, do the hops inline: spawning a sub-agent over a handful of
+    short documents costs more than it saves and can sever the cross-document
+    link you need.
+  - Verify the WHOLE chain before answering: re-read the supporting text for
+    each hop, confirm the bridge entity is the same one throughout, and check
+    the final answer actually satisfies the original question. Cite the sources
+    you relied on.
   - When confident, call answer(...) — a string, or a variable holding your
     full result — citing what you relied on.
 
