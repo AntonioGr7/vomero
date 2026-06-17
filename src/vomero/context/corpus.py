@@ -15,6 +15,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .source import AccessLogged
+
 # Extensions we treat as text-readable by default.
 _TEXT_EXT = {
     ".txt", ".md", ".markdown", ".rst", ".py", ".js", ".ts", ".tsx", ".jsx",
@@ -33,7 +35,7 @@ class Match:
         return f"{self.path}:{self.lineno}: {self.line.strip()[:200]}"
 
 
-class Corpus:
+class Corpus(AccessLogged):
     """A read-only, lazy handle on a folder of data/documents.
 
     Satisfies the `Source` seam (see context/source.py), so the engine drives it
@@ -95,12 +97,17 @@ class Corpus:
     def read(self, path: str, encoding: str = "utf-8") -> str:
         """Full text of one file. Use sparingly on big files — prefer peek/grep
         or delegate to `llm()`/`rlm()`."""
-        return self._resolve(path).read_text(encoding=encoding, errors="replace")
+        text = self._resolve(path).read_text(encoding=encoding, errors="replace")
+        self._record("read", path)
+        return text
 
     def peek(self, path: str, lines: int = 40) -> str:
         """First `lines` lines of a file."""
-        text = self.read(path)
+        # Read directly (not via self.read) so this logs a single "peek", not
+        # an extra "read".
+        text = self._resolve(path).read_text(encoding="utf-8", errors="replace")
         head = text.splitlines()[:lines]
+        self._record("peek", path)
         return "\n".join(head)
 
     def size(self, path: str) -> int:
@@ -121,12 +128,15 @@ class Corpus:
         results: list[Match] = []
         for rel in self.files(glob=glob):
             try:
-                text = self.read(rel)
+                # Read raw (not self.read) — scanning a file during grep is not
+                # a model "read"; only the matching lines are logged, below.
+                text = self._resolve(rel).read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
             for i, line in enumerate(text.splitlines(), start=1):
                 if rx.search(line):
                     results.append(Match(rel, i, line))
+                    self._record("grep", rel, i, line)
                     if len(results) >= max_results:
                         return results
         return results
@@ -134,7 +144,11 @@ class Corpus:
     # -- scoping ---------------------------------------------------------
     def subset(self, paths: list[str]) -> "Corpus":
         """A new Corpus view restricted to `paths` (for scoped recursion)."""
-        return Corpus(self.root, allow=list(paths))
+        sub = Corpus(self.root, allow=list(paths))
+        # Share the access log so a scoped recursive sub-call's retrieval lands
+        # in the same provenance record as the root's.
+        sub._access = self._access
+        return sub
 
     # -- self-description ------------------------------------------------
     def overview(self, max_files: int = 40) -> str:

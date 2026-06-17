@@ -29,7 +29,8 @@ from vomero.usage import UsageMeter
 
 # The question to ask.
 QUESTION = """
-Which NFL player, who has been reported by The New York Times to have amassed over 800 receiving yards in just six games, is discussed by CBSSports.com as needing to average almost 153 yards in his final three games to meet a personal goal, yet is also considered by Sporting News to be at a disadvantage due to the strong pass defenses of his team's upcoming opponents?""".strip()
+what are the % of ebita margin yoy for northwind
+""".strip()
 
 # Optional follow-up questions. Each one is asked AFTER the previous, carrying
 # the prior conversation as context (the multi-turn history seam). Leave empty
@@ -40,7 +41,7 @@ FOLLOW_UPS: list[str] = [
 ]
 
 # Corpus the engine reasons over.
-CORPUS_PATH = Path(__file__).resolve().parent / "data" / "multihoprag"
+CORPUS_PATH = Path(__file__).resolve().parent / "data" / "finance" / "triarch-2024-2026"
 
 # Per-run feature toggles (override the environment defaults; None = use env).
 ENABLE_PLANNING = True       # True/False to force the TODO surface on/off
@@ -52,7 +53,10 @@ ENABLE_INTERACTION = True    # True/False to allow ask_user (answered on stdin)
 # turn a fresh env (variables reset every turn).
 PERSIST_SESSION = True
 # Durable workspace dir for the session (sandbox backend only). None => none.
-WORKSPACE_ROOT: str | None = None  # e.g. "/tmp/vomero-workspaces"
+# Set to a host dir to persist files the model writes (its cwd is /workspace in
+# the sandbox); they land under <WORKSPACE_ROOT>/<session-key>/. Here: a
+# gitignored folder so outputs show up in the IDE without being committed.
+WORKSPACE_ROOT: str | None = str(Path(__file__).resolve().parent / "data" / "workspaces")
 
 
 # ---------------------------------------------------------------------------

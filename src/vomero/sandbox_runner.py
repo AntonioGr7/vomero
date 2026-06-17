@@ -98,6 +98,13 @@ class SandboxedRunner:
             "VOMERO_MODEL": s.model,
             "VOMERO_MAX_STEPS": str(s.max_steps),
             "VOMERO_MAX_DEPTH": str(s.max_depth),
+            # Forward the interaction policy so the in-pod engine matches the
+            # host's settings. With interaction on, a sub-agent can call
+            # ask_parent() to consult the agent that delegated it (model-to-model,
+            # inside the pod). Reaching the *human* (ask_user) still degrades
+            # gracefully: the pod's stdin isn't a TTY, so there's no back-channel.
+            "VOMERO_INTERACTIVE": "true" if s.enable_interaction else "false",
+            "VOMERO_ASK_ROOT_ONLY": "true" if s.interaction_root_only else "false",
         }
         if s.api_key:
             env["VOMERO_API_KEY"] = s.api_key
@@ -122,7 +129,7 @@ class SandboxedRunner:
         bad run) raises with the worker's stderr so you can see what happened."""
         max_upload = getattr(self.pool.config, "max_upload_bytes", 32 * 1024 * 1024)
         files = _read_corpus_tree(corpus_dir, max_upload)
-        argv = ["vomero", "ask", question, "--data", _CORPUS_DIR, "--no-interactive"]
+        argv = ["vomero", "ask", question, "--data", _CORPUS_DIR]
         result = self.pool.exec(
             argv,
             input_files=files,
@@ -139,6 +146,56 @@ class SandboxedRunner:
             )
         # `vomero ask` prints the answer to stdout and usage to stderr.
         return result.stdout.strip()
+
+    def ask_stream(
+        self,
+        question: str,
+        corpus_dir: str | Path,
+        *,
+        on_chunk: Any = None,
+        timeout_s: float | None = None,
+        env: dict[str, str] | None = None,
+    ) -> str:
+        """Like `ask`, but stream the run's progress as it happens.
+
+        Runs the in-pod engine with `--verbose`, which writes its live step trace
+        (code, output, sub-calls, token usage) to STDOUT/stderr as each step
+        completes; the final answer is the run's stdout tail. Each output chunk is
+        forwarded to `on_chunk(stream, data)` in real time (`stream` is "stdout"
+        or "stderr"); the default forwards the trace (stderr) to the host's stderr.
+        Returns the final answer string."""
+        import sys
+
+        max_upload = getattr(self.pool.config, "max_upload_bytes", 32 * 1024 * 1024)
+        files = _read_corpus_tree(corpus_dir, max_upload)
+        argv = ["vomero", "ask", question, "--data", _CORPUS_DIR, "--verbose"]
+
+        def _default(stream: str, data: str) -> None:
+            if stream == "stderr":  # the live trace; stdout is the final answer
+                sys.stderr.write(data)
+                sys.stderr.flush()
+
+        sink = on_chunk or _default
+        answer_parts: list[str] = []
+        with self.pool.exec_stream(
+            argv,
+            input_files=files,
+            env=self._worker_env(env),
+            timeout_s=timeout_s or self.settings.k8s_sandbox_timeout,
+        ) as stream:
+            for chunk in stream:
+                if chunk.stream == "stdout":
+                    answer_parts.append(chunk.data)
+                sink(chunk.stream, chunk.data)
+            result = stream.result
+
+        if result is None or result.timed_out:
+            raise TimeoutError(
+                f"worker run timed out after {self.settings.k8s_sandbox_timeout}s"
+            )
+        if not result.ok:
+            raise RuntimeError(f"worker run failed (exit {result.exit_code})")
+        return "".join(answer_parts).strip()
 
     def close(self) -> None:
         """Delete the worker pods. Idempotent."""

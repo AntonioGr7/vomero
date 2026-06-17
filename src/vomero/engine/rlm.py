@@ -22,10 +22,10 @@ sub-question gets the same full power. Depth is capped to keep it finite.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
-from ..context.source import Source
+from ..context.source import AccessEvent, Source
 from ..execution import ExecutionEnvironment, InProcessEnvironment
 from ..llm.base import LLMClient, Message, ToolSpec
 from ..channel import Channel, CallbackChannel
@@ -41,6 +41,22 @@ from .todo import TodoItem, TodoList
 _BUDGET_NOTICE = (
     "[budget exhausted: this sub-call was skipped to keep the run within its "
     "token/call limit. Answer now with what you already have.]"
+)
+
+# Emitted as a final user turn when the run hits its step limit before
+# answering: ask the model to organize the partial findings rather than
+# leaving the user with a bare "stopped" notice.
+_PARTIAL_SYNTHESIS_PROMPT = (
+    "You have reached the step limit and cannot do any more work or tool "
+    "calls. Using ONLY what you have already gathered above, write a brief, "
+    "honest reply that:\n"
+    "1. States up front that the step limit was reached, so this answer is "
+    "partial and may be incomplete.\n"
+    "2. Organizes and presents the relevant findings you did gather so far, "
+    "if any are useful.\n"
+    "3. Notes briefly what is still unresolved.\n"
+    "If nothing useful was found, say that plainly instead of guessing. Be "
+    "concise and do not fabricate an answer."
 )
 
 PYTHON_TOOL = ToolSpec(
@@ -87,9 +103,13 @@ HELPERS_AND_STRATEGY = """
                 them all in parallel — far faster than calling llm() in a loop.
 
   rlm(question, scope=None) -> str
-                A recursive Vomero call on the (optionally scoped) data. Use it
-                to delegate a self-contained sub-question that itself needs
-                exploration. `scope` narrows what the sub-call sees, using the
+                Spawn a fresh Vomero SUB-AGENT on the (optionally scoped) data.
+                It gets the same full power you have — its own REPL, its own
+                exploration — and returns just its sub-answer, so the raw work
+                stays out of YOUR context. This is how you decompose: delegate a
+                self-contained sub-question that itself needs searching/reading,
+                rather than doing every hop inline and bloating your own
+                transcript. `scope` narrows what the sub-call sees, using the
                 same selector `{name}.subset(...)` takes. Returns the sub-answer.
 
   answer(value) Record your FINAL answer and finish. `value` may be a string OR
@@ -105,8 +125,14 @@ Strategy:
   - NEVER print a large amount of raw text into the transcript. Hold it in a
     variable and pass it to llm()/rlm() to distill — keep raw text out of your
     own context.
-  - For multi-hop questions, chain: find A, then use what you learned to find B,
-    cross-check, aggregate.
+  - DECOMPOSE before diving in. For a multi-hop question, name the hops first
+    (e.g. "who is the Green performer?" -> "who is their spouse?"). Then for each
+    hop that is self-contained and itself needs exploration, delegate it with
+    rlm(hop, scope=...) and use the sub-answer to drive the next hop — find A,
+    then use A to find B, cross-check, aggregate. Prefer delegating a hop over
+    chaining every step inline: a sub-agent keeps that hop's raw search out of
+    your context and can recurse further if the hop is itself multi-step. Do the
+    work inline only for cheap, direct lookups that don't warrant a sub-agent.
   - Verify before answering: re-check claims, count, and cite your sources.
   - When confident, call answer(...) — a string, or a variable holding your
     full result — citing what you relied on.
@@ -258,6 +284,11 @@ class RunResult:
     trajectory: list[Step]
     tokens: int
     calls: int
+    # What the model retrieved from the source over the whole run (root + any
+    # recursive sub-calls): grep hits carry their doc+line+text, reads/peeks
+    # just the doc that was touched. Structured provenance for grounding the
+    # answer back to its source, so consumers don't parse it out of stdout.
+    provenance: list[AccessEvent] = field(default_factory=list)
 
 
 class _TrajectoryRecorder:
@@ -373,14 +404,20 @@ class RLMEngine:
         recorder = _TrajectoryRecorder(channel) if return_trajectory else None
         if recorder is not None:
             channel = recorder
+            # Capture structured retrieval provenance alongside the trajectory.
+            # subset() shares this log, so recursive sub-calls record into it too.
+            if hasattr(source, "enable_access_log"):
+                source.enable_access_log()
         meter = meter or UsageMeter()
 
         def _finish(ans: str):
             """Wrap the answer as a RunResult when a trajectory was requested."""
             if recorder is None:
                 return ans
+            provenance = source.access_log if hasattr(source, "access_log") else []
             return RunResult(answer=ans, trajectory=recorder.steps,
-                            tokens=meter.total_tokens, calls=meter.calls)
+                            tokens=meter.total_tokens, calls=meter.calls,
+                            provenance=provenance)
         # Resolve per-run planning against the engine defaults (so recursion and
         # the server can override without mutating the shared engine).
         if enable_planning is None:
@@ -670,4 +707,25 @@ class RLMEngine:
         if "value" in holder:
             return _finish(holder["value"])
         reason = "budget exhausted" if meter.exhausted else "reached max steps"
+
+        # No final answer was produced. Rather than returning a bare stop
+        # notice, make one best-effort synthesis pass: organize whatever
+        # partial findings the run gathered and hand them back with a clear
+        # caveat that the run was cut short. Skipped when the budget is
+        # exhausted — another model call would run past the cost guard we
+        # just stopped at, so there we fall back to the plain notice.
+        if not meter.exhausted:
+            synth = list(messages) + [Message("user", _PARTIAL_SYNTHESIS_PROMPT)]
+            try:
+                resp = self.client.complete(synth, model=self.model)
+            except Exception:
+                resp = None
+            if resp is not None:
+                meter.record(resp.usage, sent_messages=synth,
+                             response_text=resp.content)
+                partial = (resp.content or "").strip()
+                if partial:
+                    channel.emit(Step(depth=depth, index=current["index"],
+                                      final=partial))
+                    return _finish(partial)
         return _finish(f"Stopped: {reason} without a final answer.")

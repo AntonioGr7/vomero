@@ -18,6 +18,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .source import AccessLogged
+
 # Separator used when the documents are joined into one addressable text (for
 # slice/chunk). Kept distinctive so it doesn't collide with document content.
 _JOIN = "\n\n"
@@ -35,7 +37,7 @@ class Match:
         return f"[doc {self.doc}] line {self.lineno}: {self.line.strip()[:200]}"
 
 
-class Context:
+class Context(AccessLogged):
     """A read-only, lazy handle on an in-memory blob.
 
     Parameters
@@ -87,15 +89,18 @@ class Context:
         all at once would defeat the point — chunk/grep instead)."""
         if doc is None:
             if self._single:
+                self._record("read", 0)
                 return self._docs[0]
             raise ValueError(
                 f"This context has {self.n_docs} documents; pass an index, "
                 "e.g. context.read(0). To scan them all, use grep/chunk."
             )
+        self._record("read", doc)
         return self._docs[doc]
 
     def peek(self, doc: int = 0, lines: int = 40) -> str:
         """First `lines` lines of document `doc`."""
+        self._record("peek", doc)
         return "\n".join(self._docs[doc].splitlines()[:lines])
 
     def slice(self, start: int, end: int) -> str:
@@ -117,6 +122,7 @@ class Context:
             for i, line in enumerate(text.splitlines(), start=1):
                 if rx.search(line):
                     out.append(Match(di, i, line))
+                    self._record("grep", di, i, line)
                     if len(out) >= max_results:
                         return out
         return out
@@ -148,8 +154,13 @@ class Context:
         text."""
         if isinstance(selector, tuple):
             start, end = selector
-            return Context(self.text[start:end], name=self.repl_name)
-        return Context([self._docs[i] for i in selector], name=self.repl_name)
+            sub = Context(self.text[start:end], name=self.repl_name)
+        else:
+            sub = Context([self._docs[i] for i in selector], name=self.repl_name)
+        # Share the access log so a scoped recursive sub-call records into the
+        # same provenance record as the root's.
+        sub._access = self._access
+        return sub
 
     # -- Source seam -----------------------------------------------------
     def overview(self, preview_chars: int = 800) -> str:
