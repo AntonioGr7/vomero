@@ -400,6 +400,19 @@ def serve(data: str, host: str = "127.0.0.1", port: int = 8000,
 
     settings = settings or Settings.from_env()
     manager = build_manager(settings, data)
+
+    # Build/open the search index at STARTUP (not lazily on the first question),
+    # with visible progress — so the first user isn't slow and the operator can
+    # see the corpus being prepared. Skipped with VOMERO_WARMUP=0 (grep-only).
+    if settings.warmup_search:
+        import time
+        print(f"preparing search index for {manager.corpus.root} … "
+              "(this can take a while on a large corpus)", file=sys.stderr, flush=True)
+        t0 = time.monotonic()
+        status = manager.corpus.warmup()
+        print(f"  ✓ search ready: {status}  ({time.monotonic() - t0:.1f}s)",
+              file=sys.stderr, flush=True)
+
     httpd = ThreadingHTTPServer((host, port), _Handler)
     httpd.manager = manager  # type: ignore[attr-defined]
 

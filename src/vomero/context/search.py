@@ -173,6 +173,12 @@ class HybridIndex:
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored
 
+    def warmup(self) -> None:
+        """Force the lazy dense vectors to embed/load now (BM25 is already built
+        in __init__). Lets a server pay this at startup, not on the first query."""
+        if self._embedder is not None:
+            self._ensure_doc_vecs()
+
     def search(self, query: str, k: int = 10, mode: str = "hybrid") -> list[Hit]:
         """Top-`k` ranked hits. `mode`: 'lexical' (BM25 only), 'dense' (embeddings
         only — needs an embedder), or 'hybrid' (RRF fusion of both; falls back to

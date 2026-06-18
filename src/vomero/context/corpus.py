@@ -176,6 +176,27 @@ class Corpus(AccessLogged):
             self._record("search", h.doc, text=h.snippet)
         return hits
 
+    def warmup(self) -> str:
+        """Resolve and prime the search backend NOW, instead of lazily on the
+        first search() — so a long-lived server pays the cost at startup, not on
+        the first user's question. Builds the in-memory index (reading every file
+        once), opens a persistent index (and loads its vectors), or no-ops for an
+        external service. Returns a human-readable status for startup logging."""
+        backend = self._open_index()
+        self._index = backend
+        warm = getattr(backend, "warmup", None)
+        if callable(warm):
+            warm()
+        # Status keyed off how the backend was resolved (its precedence), not its
+        # class name — so a custom injected backend is reported accurately.
+        if self._backend is not None:
+            url = getattr(backend, "url", None)
+            return (f"external retrieval service ({url})" if url
+                    else f"injected backend ({type(backend).__name__})")
+        if type(backend).__name__ == "PersistentIndex":
+            return f"persistent index at {self._index_dir}"
+        return f"in-memory index over {len(self.files())} file(s)"
+
     def _open_index(self):
         """Resolve the search backend, in precedence order: an explicitly
         injected `backend` (e.g. a RemoteBackend → external service); else a

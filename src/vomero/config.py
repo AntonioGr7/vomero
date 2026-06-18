@@ -88,6 +88,12 @@ class Settings:
     # lazy in-memory index (cold-start cost on first search).
     index_dir: str = ""
 
+    # Build/open the search index at server STARTUP (eagerly) rather than lazily
+    # on the first user's question — so the first request isn't slow and the boot
+    # log shows the index being prepared. Set VOMERO_WARMUP=0 for grep-only
+    # corpora where no search index is needed.
+    warmup_search: bool = True
+
     # RLM loop limits
     max_steps: int = 24
     max_depth: int = 3
@@ -191,6 +197,8 @@ class Settings:
             retrieval_collection=os.getenv("VOMERO_RETRIEVAL_COLLECTION", ""),
             retrieval_api_key=os.getenv("VOMERO_RETRIEVAL_API_KEY") or None,
             index_dir=os.getenv("VOMERO_INDEX_DIR", ""),
+            warmup_search=os.getenv("VOMERO_WARMUP", "1").strip().lower()
+            not in ("0", "false", "no"),
             max_steps=int(os.getenv("VOMERO_MAX_STEPS", "24")),
             max_depth=int(os.getenv("VOMERO_MAX_DEPTH", "3")),
             max_output_chars=int(os.getenv("VOMERO_MAX_OUTPUT_CHARS", "10000")),

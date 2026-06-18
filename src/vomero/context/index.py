@@ -156,6 +156,13 @@ class PersistentIndex:
             array.array("f", raw[i * stride:(i + 1) * stride]) for i in range(len(order))
         ]
 
+    def warmup(self) -> None:
+        """Open the on-disk index and load the dense vectors now, so a server
+        pays it at startup instead of on the first dense query."""
+        self._load()
+        if self._embedder is not None:
+            self._load_vectors()
+
     def is_stale(self, docs: list[tuple[str, str]]) -> bool:
         """True if the current documents differ from what was indexed (added,
         removed, or content-changed) — so the caller knows to rebuild."""
