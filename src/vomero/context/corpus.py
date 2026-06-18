@@ -14,8 +14,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .source import AccessLogged
+
+if TYPE_CHECKING:  # annotations only; never imported at module load
+    from .search import Embedder, Hit
 
 # Extensions we treat as text-readable by default.
 _TEXT_EXT = {
@@ -53,11 +57,27 @@ class Corpus(AccessLogged):
     # The REPL variable name the engine injects this under (the `Source` seam).
     repl_name = "corpus"
 
-    def __init__(self, root: str | Path, allow: list[str] | None = None):
+    def __init__(self, root: str | Path, allow: list[str] | None = None,
+                 *, embedder: "Embedder | None" = None,
+                 index_dir: str | Path | None = None,
+                 backend=None):
         self.root = Path(root).expanduser().resolve()
         if not self.root.exists():
             raise FileNotFoundError(f"Corpus root does not exist: {self.root}")
         self._allow = set(allow) if allow is not None else None
+        # Optional dense-retrieval embedder for the LOCAL search backends; None
+        # => BM25-only. Ignored when an external `backend` is supplied.
+        self._embedder = embedder
+        # A prebuilt persistent index dir (see `vomero index`). When set and
+        # valid, search() opens it READ-ONLY — built once, loaded, never rebuilt
+        # in the request path. None => the lazy in-memory index below.
+        self._index_dir = Path(index_dir).expanduser().resolve() if index_dir else None
+        # An explicit RetrievalBackend (context/retrieval.py). When given it wins
+        # over the local index paths — e.g. a RemoteBackend so the vectors/index
+        # live in an external service and this process holds no retrieval state.
+        self._backend = backend
+        # Lazily-resolved search backend, cached per view (a subset rebuilds).
+        self._index = None
 
     # -- discovery -------------------------------------------------------
     def files(self, glob: str = "**/*", text_only: bool = True) -> list[str]:
@@ -141,10 +161,56 @@ class Corpus(AccessLogged):
                         return results
         return results
 
+    def search(self, query: str, k: int = 10, mode: str = "hybrid") -> list[Hit]:
+        """Ranked relevance search — the recall-friendly alternative to grep.
+
+        Returns the top-`k` files ranked by how well they match the WHOLE query
+        (BM25, plus dense embeddings when configured), not just lines containing
+        a literal substring. Use it when the phrasing is uncertain or you want
+        the most relevant documents rather than every exact hit; follow up with
+        read()/peek() on the hits. `mode` is 'lexical', 'dense', or 'hybrid'."""
+        if self._index is None:
+            self._index = self._open_index()
+        hits = self._index.search(query, k=k, mode=mode)
+        for h in hits:
+            self._record("search", h.doc, text=h.snippet)
+        return hits
+
+    def _open_index(self):
+        """Resolve the search backend, in precedence order: an explicitly
+        injected `backend` (e.g. a RemoteBackend → external service); else a
+        prebuilt persistent index opened read-only when `index_dir` is present;
+        else a lazy in-memory index built from this view's files. Imported lazily
+        so the module loads even where search.py isn't importable (the sandbox
+        loads corpus.py standalone; there search() is delegated to the host)."""
+        if self._backend is not None:
+            return self._backend
+
+        from .search import HybridIndex
+
+        if self._index_dir is not None:
+            from .index import PersistentIndex
+
+            if PersistentIndex.exists(self._index_dir):
+                return PersistentIndex(self._index_dir, embedder=self._embedder)
+        # Read raw (not self.read) — building the index is not a model "read";
+        # only the returned hits are logged as retrieval, by the caller.
+        docs = []
+        for rel in self.files():
+            try:
+                docs.append((rel, self._resolve(rel).read_text(
+                    encoding="utf-8", errors="replace")))
+            except Exception:
+                continue
+        return HybridIndex(docs, embedder=self._embedder)
+
     # -- scoping ---------------------------------------------------------
     def subset(self, paths: list[str]) -> "Corpus":
         """A new Corpus view restricted to `paths` (for scoped recursion)."""
-        sub = Corpus(self.root, allow=list(paths))
+        # A subset only sees `paths`, so it builds its own in-memory index over
+        # them rather than the whole-corpus persistent index (which would return
+        # out-of-scope docs); index_dir is intentionally not propagated.
+        sub = Corpus(self.root, allow=list(paths), embedder=self._embedder)
         # Share the access log so a scoped recursive sub-call's retrieval lands
         # in the same provenance record as the root's.
         sub._access = self._access
@@ -168,6 +234,7 @@ class Corpus(AccessLogged):
             "                  corpus.tree()               -> file tree\n"
             "                  corpus.files(glob=\"**/*\")   -> list of relative paths\n"
             "                  corpus.grep(pattern, ...)   -> regex search -> [Match(path, lineno, line)]\n"
+            "                  corpus.search(query, k=10)  -> ranked-relevance search -> [Hit(doc, score, snippet)]\n"
             "                  corpus.peek(path, lines=40) -> first lines of a file\n"
             "                  corpus.read(path)           -> full text of a file\n"
             "                  corpus.size(path)           -> bytes\n"

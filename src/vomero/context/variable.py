@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .source import AccessLogged
+
+if TYPE_CHECKING:  # annotations only; never imported at module load
+    from .search import Embedder, Hit
 
 # Separator used when the documents are joined into one addressable text (for
 # slice/chunk). Kept distinctive so it doesn't collide with document content.
@@ -51,7 +55,8 @@ class Context(AccessLogged):
 
     repl_name: str
 
-    def __init__(self, data: str | list[str], *, name: str = "context"):
+    def __init__(self, data: str | list[str], *, name: str = "context",
+                 embedder: "Embedder | None" = None):
         if isinstance(data, str):
             self._docs: list[str] = [data]
             self._single = True
@@ -59,6 +64,12 @@ class Context(AccessLogged):
             self._docs = [str(d) for d in data]
             self._single = False
         self.repl_name = name
+        # Optional dense-retrieval embedder for search(); None => BM25-only.
+        self._embedder = embedder
+        # Lazily-built ranked-search index, cached (a subset rebuilds its own).
+        self._index: HybridIndex | None = None
+        # Passage size (chars) when ranking a single long document.
+        self._passage_chars = 1000
 
     # -- sizing ----------------------------------------------------------
     @property
@@ -127,6 +138,37 @@ class Context(AccessLogged):
                         return out
         return out
 
+    def search(self, query: str, k: int = 10, mode: str = "hybrid") -> list["Hit"]:
+        """Ranked relevance search — the recall-friendly alternative to grep.
+
+        Returns the top-`k` passages ranked by how well they match the WHOLE
+        query (BM25, plus dense embeddings when configured). For a multi-doc
+        context each hit's `doc` is a document index (read it with read(doc));
+        for a single long document each hit carries a char `span` (read it with
+        slice(*span)). `mode` is 'lexical', 'dense', or 'hybrid'."""
+        from .search import Hit, HybridIndex  # lazy: keeps module load light
+
+        if self._index is None:
+            self._index = HybridIndex(self._passages(), embedder=self._embedder)
+        hits: list[Hit] = []
+        for h in self._index.search(query, k=k, mode=mode):
+            doc_idx, span = h.doc  # the (doc index, char span | None) locator
+            self._record("search", doc_idx, text=h.snippet)
+            hits.append(Hit(doc=doc_idx, score=h.score, snippet=h.snippet, span=span))
+        return hits
+
+    def _passages(self) -> list[tuple[tuple[int, tuple[int, int] | None], str]]:
+        """Documents to rank, each as ((doc index, char span | None), text). A
+        multi-doc context ranks whole documents; a single long document is split
+        into char-span passages so search can point at the relevant region."""
+        if not self._single:
+            return [((i, None), self._docs[i]) for i in range(self.n_docs)]
+        text = self._docs[0]
+        size = self._passage_chars
+        out = [((0, (s, min(s + size, len(text)))), text[s:s + size])
+               for s in range(0, len(text), size)]
+        return out or [((0, None), text)]
+
     def docs_matching(self, pattern: str, ignore_case: bool = True) -> list[int]:
         """Indices of documents whose text matches `pattern` — pair with
         `subset(...)` to scope a recursive call to just the relevant documents."""
@@ -154,9 +196,11 @@ class Context(AccessLogged):
         text."""
         if isinstance(selector, tuple):
             start, end = selector
-            sub = Context(self.text[start:end], name=self.repl_name)
+            sub = Context(self.text[start:end], name=self.repl_name,
+                          embedder=self._embedder)
         else:
-            sub = Context([self._docs[i] for i in selector], name=self.repl_name)
+            sub = Context([self._docs[i] for i in selector], name=self.repl_name,
+                          embedder=self._embedder)
         # Share the access log so a scoped recursive sub-call records into the
         # same provenance record as the root's.
         sub._access = self._access
@@ -184,6 +228,7 @@ class Context(AccessLogged):
             f"                  {n}.read(doc)             -> full text of one document\n"
             f"                  {n}.slice(start, end)     -> a character slice of the data\n"
             f"                  {n}.grep(pattern, ...)    -> regex search -> [Match(doc, lineno, line)]\n"
+            f"                  {n}.search(query, k=10)   -> ranked-relevance search -> [Hit(doc, score, snippet, span)]\n"
             f"                  {n}.docs_matching(pat)    -> indices of documents that match (to scope rlm)\n"
             f"                  {n}.chunk(size, overlap=0)-> split into char chunks (for map/reduce over llm())\n"
             f"                  {n}.subset(sel)           -> scope to doc indices [i, j] or a (start, end) char range\n"

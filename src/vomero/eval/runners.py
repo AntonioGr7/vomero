@@ -27,7 +27,11 @@ from ..usage import UsageMeter
 # RLM engine via `extra_instructions` and to the baseline's system prompt.
 TERSE_ANSWER = (
     "Answer with ONLY the shortest exact answer span — a name, entity, number, "
-    "date, or yes/no. No explanation, no full sentence, no surrounding text."
+    "date, or yes/no. No explanation, no full sentence, no surrounding text. "
+    "If — after searching thoroughly — the data does not contain enough to "
+    "answer the question, reply with exactly: Insufficient information. Do not "
+    "guess: a wrong guess scores no better than abstaining, and abstaining when "
+    "the answer IS present is itself an error."
 )
 
 
@@ -38,6 +42,11 @@ class Outcome:
     calls: int
     seconds: float
     truncated: bool = False  # baseline only: context didn't fit and was cut
+    # Relative paths the RLM run actually retrieved (read/peek/grep), from the
+    # source access log. The retrieval-recall metric scores this against the
+    # question's gold evidence docs. None when provenance wasn't captured
+    # (baseline/closed-book don't navigate a source).
+    retrieved_docs: set[str] | None = None
 
 
 class RLMRunner:
@@ -54,11 +63,18 @@ class RLMRunner:
         meter = UsageMeter(
             max_total_tokens=self._budget[0], max_total_calls=self._budget[1]
         )
+        # Isolate this item's provenance: the source is shared across items, so
+        # clear the log before the run (return_trajectory re-enables it). The set
+        # of docs the run touched is the input to the retrieval-recall metric.
+        if hasattr(source, "reset_access_log"):
+            source.reset_access_log()
         t0 = time.monotonic()
-        ans = self.engine.run(question, source, channel=NullChannel(), meter=meter)
+        result = self.engine.run(question, source, channel=NullChannel(),
+                                 meter=meter, return_trajectory=True)
+        retrieved = {str(e.doc) for e in result.provenance}
         return Outcome(
-            answer=ans, tokens=meter.total_tokens, calls=meter.calls,
-            seconds=time.monotonic() - t0,
+            answer=result.answer, tokens=meter.total_tokens, calls=meter.calls,
+            seconds=time.monotonic() - t0, retrieved_docs=retrieved,
         )
 
 

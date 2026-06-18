@@ -121,7 +121,15 @@ HELPERS_AND_STRATEGY = """
 
 Strategy:
   - Start by calling {start} (print it) to see what you have.
-  - Locate what's relevant by searching/slicing before reading wholesale.
+  - Locate what's relevant by searching/slicing before reading wholesale. You
+    have TWO complementary search tools, use the right one:
+      * search(query, k) — ranked by RELEVANCE to the whole query (handles
+        paraphrase: a "spouse" hop also surfaces "married to", "wife"). Reach
+        for this FIRST when the phrasing is uncertain or you want the most
+        relevant documents — exactly the multi-hop case, where the bridge entity
+        is rarely worded like the question. Then read()/peek() the top hits.
+      * grep(pattern) — EXACT substring/regex. Use it for precise lookups once
+        you know the literal string (a name, code, date) and want every hit.
   - NEVER print a large amount of raw text into the transcript. Hold it in a
     variable and pass it to llm()/rlm() to distill — keep raw text out of your
     own context.
@@ -146,6 +154,13 @@ Strategy:
     each hop, confirm the bridge entity is the same one throughout, and check
     the final answer actually satisfies the original question. Cite the sources
     you relied on.
+  - CHECK SUFFICIENCY before answering. For every part of the question, point to
+    the specific text you found that supports it. If — after searching
+    thoroughly with several phrasings — the data does not actually contain
+    enough to answer, say so plainly and DO NOT guess: an honest "the data does
+    not contain this" is correct, a fabricated answer is not. A bridge entity
+    you could not confirm, or a hop with no supporting text, means you cannot
+    answer yet — keep searching or abstain, don't paper over the gap.
   - When confident, call answer(...) — a string, or a variable holding your
     full result — citing what you relied on.
 

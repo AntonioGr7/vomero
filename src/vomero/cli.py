@@ -21,10 +21,11 @@ from pathlib import Path
 from .channel import CallbackChannel
 from .config import Settings, normalize_exec_backend
 from .context import Context, Corpus
+from .context.retrieval import build_retrieval_backend
 from .engine import Compactor, RLMEngine
 from .engine.rlm import Step
 from .execution import build_env_factory
-from .llm import build_client
+from .llm import build_client, build_embedder
 from .usage import UsageMeter
 
 
@@ -189,12 +190,16 @@ def cmd_ask(args: argparse.Namespace) -> int:
     if bool(args.data) == bool(args.text):
         print("error: pass exactly one of --data <folder> or --text <file|->", file=sys.stderr)
         return 2
+    embedder = build_embedder(settings)  # None unless VOMERO_EMBEDDING_MODEL set
+    backend = build_retrieval_backend(settings)  # None unless VOMERO_RETRIEVAL_URL set
     try:
         if args.data:
-            source = Corpus(args.data)
+            source = Corpus(args.data, embedder=embedder,
+                            index_dir=getattr(args, "index_dir", None),
+                            backend=backend)
         else:
             blob = sys.stdin.read() if args.text == "-" else _read_text(args.text)
-            source = Context(blob)
+            source = Context(blob, embedder=embedder)
     except (FileNotFoundError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -296,10 +301,12 @@ def cmd_eval(args: argparse.Namespace) -> int:
     # in-memory context anyway. Opt back in with --sandbox (folder corpora only).
     settings.exec_backend = "gvisor" if args.sandbox else "inprocess"
 
+    # Optional dense embedder for hybrid search() (None unless configured).
+    embedder = build_embedder(settings)
     # Load items (each carries the question, gold answer, and its data source).
     try:
         if args.jsonl:
-            source = Corpus(args.data) if args.data else None
+            source = Corpus(args.data, embedder=embedder) if args.data else None
             items = load_jsonl(args.jsonl, source=source, limit=args.limit)
         elif args.benchmark == "needle":
             items = make_needle_items(
@@ -308,7 +315,8 @@ def cmd_eval(args: argparse.Namespace) -> int:
             )
         elif args.benchmark == "multihoprag":
             items = load_multihoprag(args.data or "data/multihoprag",
-                                     limit=args.limit, mode=args.source_mode)
+                                     limit=args.limit, mode=args.source_mode,
+                                     embedder=embedder)
         else:
             print(f"error: unknown benchmark {args.benchmark!r}", file=sys.stderr)
             return 2
@@ -389,6 +397,51 @@ def cmd_eval(args: argparse.Namespace) -> int:
     print("\n" + "=" * 70, file=sys.stderr)
     for rep in reports:
         print(rep.summary())
+        # Diagnostics: did retrieval surface the gold evidence (recall, sliced by
+        # hop count), and is abstention calibrated (correct on null queries, not
+        # giving up on answerable ones)? These localize multi-hop failures to
+        # retrieval vs. reasoning, and quantify hallucination on null queries.
+        recall = rep.recall_summary()
+        if recall:
+            print(recall)
+        print(rep.abstention_summary())
+        bt = rep.by_type()
+        if bt:
+            print(bt)
+    return 0
+
+
+def cmd_index(args: argparse.Namespace) -> int:
+    """Build a persistent search index for a corpus folder (the offline,
+    build-once step that serving reads read-only)."""
+    from .context.index import PersistentIndex
+
+    settings = Settings.from_env()
+    if args.model:
+        settings.model = args.model
+    root = Path(args.data).expanduser().resolve()
+    if not root.exists():
+        print(f"error: corpus folder not found: {root}", file=sys.stderr)
+        return 2
+    index_dir = Path(args.index_dir).expanduser().resolve() if args.index_dir \
+        else root.parent / f"{root.name}.vomero-index"
+
+    corpus = Corpus(root)
+    docs = [(rel, corpus.read(rel)) for rel in corpus.files()]
+    if not docs:
+        print(f"error: no text files under {root}", file=sys.stderr)
+        return 2
+
+    embedder = build_embedder(settings)
+    dense = embedder is not None
+    print(f"Indexing {len(docs)} document(s) from {root}\n"
+          f"  lexical: SQLite FTS5"
+          + (f"  |  dense: {settings.embedding_model}" if dense
+             else "  |  dense: off (set VOMERO_EMBEDDING_MODEL to enable)")
+          + f"\n  → {index_dir}", file=sys.stderr)
+    PersistentIndex.build(docs, index_dir, embedder=embedder,
+                          embedding_model=settings.embedding_model)
+    print(f"Done. Use it with:  vomero ask --data {root} --index-dir {index_dir} ...")
     return 0
 
 
@@ -399,6 +452,9 @@ def build_parser() -> argparse.ArgumentParser:
     ask = sub.add_parser("ask", help="Ask a question about a data folder.")
     ask.add_argument("question", help="The question to answer.")
     ask.add_argument("--data", default=None, help="Path to the data folder (the corpus).")
+    ask.add_argument("--index-dir", default=None,
+                     help="Use a prebuilt persistent search index (see `vomero index`) "
+                          "instead of building one in-memory at query time.")
     ask.add_argument("--text", default=None,
                      help="Mount an in-memory context instead of a folder: a file path, "
                           "or '-' to read the context from stdin. (RLM context-as-a-variable.)")
@@ -450,6 +506,14 @@ def build_parser() -> argparse.ArgumentParser:
     srv.add_argument("--port", type=int, default=8000, help="Bind port (default 8000).")
     srv.add_argument("--model", default=None, help="Override the model name.")
     srv.set_defaults(func=cmd_serve)
+
+    ix = sub.add_parser("index", help="Build a persistent search index for a corpus folder "
+                                      "(offline build-once; serving opens it read-only).")
+    ix.add_argument("--data", required=True, help="Path to the data folder to index.")
+    ix.add_argument("--index-dir", default=None,
+                    help="Where to write the index (default: <data>.vomero-index next to it).")
+    ix.add_argument("--model", default=None, help="Override the model name (unused unless embedding).")
+    ix.set_defaults(func=cmd_index)
 
     ev = sub.add_parser("eval", help="Measure RLM vs. a stuff-the-context baseline on a benchmark.")
     ev.add_argument("--benchmark", default="multihoprag",

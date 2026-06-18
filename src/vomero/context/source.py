@@ -60,6 +60,14 @@ class AccessLogged:
             self._access = []
         return self._access
 
+    def reset_access_log(self) -> None:
+        """Clear the log in place (keeps it enabled). A `Source` is often shared
+        across many runs (e.g. one Corpus reused for every eval item); resetting
+        between runs isolates each run's provenance instead of accumulating it.
+        Clears in place so `subset()` views sharing the list see the reset too."""
+        if self._access is not None:
+            self._access.clear()
+
     def _record(self, op: str, doc: str | int,
                 lineno: int | None = None, text: str | None = None) -> None:
         if self._access is not None:

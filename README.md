@@ -50,8 +50,8 @@ The model's REPL has the data handle plus a few host-backed functions:
 
 ```
 corpus / context   The data, navigated lazily (never dumped into context).
-    Corpus:   overview() · tree() · files(glob) · grep(pat) · peek(path) · read(path) · size(path) · subset([paths])
-    Context:  overview() · len() · n_docs · peek(doc) · read(doc) · slice(a,b) · grep(pat) · docs_matching(pat) · chunk(size,overlap) · subset(sel)
+    Corpus:   overview() · tree() · files(glob) · grep(pat) · search(query,k) · peek(path) · read(path) · size(path) · subset([paths])
+    Context:  overview() · len() · n_docs · peek(doc) · read(doc) · slice(a,b) · grep(pat) · search(query,k) · docs_matching(pat) · chunk(size,overlap) · subset(sel)
 
 llm(text, system=None) -> str
     A fresh, memoryless sub-call. Distill one chunk into a variable. The chunk
@@ -73,6 +73,77 @@ answer(value)
 
 `todo` (with `--plan`) and `ask_user`/`ask_parent` (interactivity) are added when
 those features are enabled — see below.
+
+## Search & retrieval
+
+Alongside `grep` (exact substring/regex), the data handle has `search(query, k)`
+— *ranked relevance* retrieval, which is what closes the recall gap on multi-hop
+questions where the bridge entity isn't worded like the query. The same
+`search()` method runs on top of one of three backends, chosen by how you
+configure it — but the method the model calls never changes, so you can move from
+the zero-setup default to a planet-scale service without touching anything the
+model sees:
+
+1. **In-memory (default, zero setup).** The first `search()` call builds a
+   pure-Python **BM25** index over the data and caches it for the process. No
+   dependencies, no build step, nothing to configure — it just works. Fine up to
+   tens of thousands of documents. If you also set an embedding model (below),
+   this same in-memory index adds dense vectors and fuses the two (hybrid).
+2. **Persistent index (built once, loaded read-only).** Run `vomero index --data
+   <folder> --index-dir <dir>` once: it reads every document a single time,
+   writes an on-disk lexical index (SQLite FTS5) and — if an embedding model is
+   set — the document vectors, embedded once and never again. Then point a run at
+   it (`--index-dir <dir>`, or `VOMERO_INDEX_DIR`); it opens read-only, so a fresh
+   process pays no re-read and no re-embed. This is what a serving pod mounts as a
+   read-only volume. Good for large, single-deployment corpora.
+3. **External retrieval service (the scalable, multi-tenant path).** Set
+   `VOMERO_RETRIEVAL_URL` and `search()` delegates to your own retrieval service
+   (any vector DB / search engine behind a thin HTTP/JSON endpoint). The
+   documents, the index, AND the query-embedding all live in that service, so the
+   Vomero process holds **no vectors and no embedding model** — its memory stays
+   flat no matter how many corpora, how many documents, or how many different
+   embedding models are in play (each index pins its own model on the service
+   side). This is the answer to "millions of documents, many tenants": retrieval
+   is external infrastructure, and Vomero stays stateless. Precedence is
+   service → persistent index → in-memory, so setting the URL overrides the rest.
+
+Under the gVisor sandbox, `search()` is the one data method delegated back to the
+host over RPC (the sandbox is network-less and shouldn't hold the index);
+`read`/`grep`/`peek` stay local on the read-only mount. So with a service
+configured, the path is: sandbox → host (thin proxy) → your retrieval service.
+
+**You can ignore all of this.** `search()` is purely additive. Vomero works
+exactly as before without it: the model can navigate with `overview`/`grep`/
+`peek`/`read`/`slice` alone, and `llm`/`rlm`/`answer` are unchanged. You don't
+have to build an index, set an embedding model, or run a service — none of the
+three backends above is required for Vomero to answer questions. Ranked `search`
+is there when you want better recall; the original grep-and-read workflow is
+untouched.
+
+### Using BM25 alone (no embeddings, no service)
+
+BM25-only is the **default** — it's what you get when no embedding model is
+configured, so you don't need to do anything special:
+
+```python
+from vomero.context import Corpus
+corpus = Corpus("mydata")            # no embedder, no index_dir, no backend
+hits = corpus.search("who acquired the cryptocurrency exchange", k=5)
+#   -> [Hit(doc, score, snippet), ...]   ranked by BM25, pure-Python, no setup
+```
+
+To be explicit (or to force lexical even when an embedding model *is* configured),
+pass `mode="lexical"`:
+
+```python
+hits = corpus.search("...", k=5, mode="lexical")   # BM25 only, ignores embeddings
+```
+
+The modes are `"lexical"` (BM25 only), `"dense"` (embeddings only — needs an
+embedder/service), and `"hybrid"` (both, fused; the default, and it falls back to
+pure BM25 when no embedder is configured). So: leave `VOMERO_EMBEDDING_MODEL`
+unset (and don't pass `--index-dir`/`VOMERO_RETRIEVAL_URL`) and every `search()`
+is plain BM25 over the in-memory index.
 
 ## Setup
 

@@ -11,7 +11,8 @@ Shape of one run:
      functions, and method-bearing objects (`todo`). Nothing starts yet.
   2. On the first `execute()`, we open a Unix socket on a host temp dir, launch
      `docker run --runtime=runsc ...` with that dir, the corpus, and Vomero's
-     `agent.py`/`corpus.py` bind-mounted in, and hand off control to the agent.
+     `agent.py` + the `context/` package dir bind-mounted in, and hand off
+     control to the agent.
   3. Each `execute()` ships the code over the socket. While the agent runs it,
      any `llm()/rlm()/answer()/...` call comes back as an `rpc` message; we
      invoke the real host callable and return its result. When the agent sends
@@ -24,7 +25,10 @@ Shape of one run:
 The corpus is mounted read-only rather than proxied because it is read-only data
 the model is allowed to read; the sandbox exists to protect the *host* from the
 model's code (writes, network, fork bombs), not to gate corpus reads — and
-grepping a folder over RPC would be painfully slow.
+grepping a folder over RPC would be painfully slow. The one exception is
+`corpus.search`: it IS delegated to the host (registered as a host function),
+because ranked search needs the host's loaded/persistent index and, for dense
+retrieval, the network the sandbox is denied.
 """
 
 from __future__ import annotations
@@ -49,7 +53,7 @@ _CONTAINER_CORPUS = "/corpus"
 _CONTAINER_AGENT_DIR = "/opt/vomero-agent"
 # Kept OUTSIDE the agent-dir mount: a file mountpoint can't be created inside
 # another (read-only) bind mount.
-_CONTAINER_CORPUS_SRC = "/opt/vomero_corpus_src.py"
+_CONTAINER_CORPUS_SRC = "/opt/vomero_context"  # the context/ package dir, mounted ro
 _CONTAINER_SOCK_DIR = "/sock"
 _SOCK_NAME = "vomero.sock"
 _CONTAINER_WORKSPACE = "/workspace"
@@ -109,6 +113,20 @@ class SandboxEnvironment(ExecutionEnvironment):
         # before start (they're baked into the container at the init handshake).
         self._functions.update(functions)
         self._objects.update(objects)
+        # Delegate corpus.search() to the host: the sandbox keeps read/grep/peek
+        # local over the read-only mount, but search() needs the loaded index and
+        # (for dense) network the network-less sandbox can't reach. Registering it
+        # as a host function means the agent binds it as a method RPC stub. Listed
+        # in `functions`, so it ships in the init handshake.
+        if self._corpus is not None and "corpus.search" not in self._functions:
+            self._functions["corpus.search"] = self._corpus_search
+
+    def _corpus_search(self, query, k: int = 10, mode: str = "hybrid"):
+        """Run the real search on the host corpus and return JSON-able hit dicts
+        (the agent rewraps them as Hit-like objects inside the sandbox)."""
+        hits = self._corpus.search(query, k=k, mode=mode)
+        return [{"doc": h.doc, "score": h.score, "snippet": h.snippet,
+                 "span": list(h.span) if h.span else None} for h in hits]
 
     def execute(self, code: str) -> ExecResult:
         self._ensure_started()
@@ -179,6 +197,10 @@ class SandboxEnvironment(ExecutionEnvironment):
             )
 
     def _resolve_target(self, key: str) -> Callable[..., Any]:
+        # Exact-match a registered function first, so dotted delegates like
+        # "corpus.search" resolve as host functions rather than object proxies.
+        if key in self._functions:
+            return self._functions[key]
         if "." in key:
             obj, method = key.split(".", 1)
             return self._objects[obj][method]
@@ -264,7 +286,10 @@ class SandboxEnvironment(ExecutionEnvironment):
         isolation, no mounts, paths are the host's real paths)."""
         agent_dir = Path(__file__).resolve().parent
         agent_py = agent_dir / "agent.py"
-        corpus_src = Path(_corpus_module.__file__).resolve()
+        # The whole `context/` package dir (not just corpus.py): corpus.py uses
+        # relative imports (`.source`, `.search`), so it must load as a package
+        # submodule. Every file in it is stdlib-only, so it runs on a bare image.
+        corpus_src = Path(_corpus_module.__file__).resolve().parent
         corpus_root = str(Path(self._corpus.root))
 
         if self.config.runner == "local":

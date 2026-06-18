@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from pathlib import Path
 
 from ..context import Context, Corpus
@@ -21,6 +22,47 @@ from .harness import EvalItem
 # Field-name aliases seen across QA datasets.
 _Q_KEYS = ("question", "query", "q", "prompt")
 _A_KEYS = ("answer", "gold", "label", "a", "output")
+
+_URL_RE = re.compile(r"^- url: (.+)$", re.M)
+_TITLE_RE = re.compile(r"^- title: (.+)$", re.M)
+
+
+def _build_evidence_index(corpus: Corpus) -> tuple[dict[str, str], dict[str, str]]:
+    """Map each corpus article back to its source identity, so a question's gold
+    `evidence_list` (which carries article url/title, not file paths) can be
+    resolved to the relative paths the runner would actually retrieve.
+
+    Returns (url -> path, title -> path). The corpus files carry both in their
+    frontmatter (see data/download_corpus.py); url is the more reliable key,
+    title the fallback. Cheap: reads only each file's head."""
+    url2path: dict[str, str] = {}
+    title2path: dict[str, str] = {}
+    for rel in corpus.files():
+        head = corpus.peek(rel, lines=12)
+        if m := _URL_RE.search(head):
+            url2path[m.group(1).strip()] = rel
+        if m := _TITLE_RE.search(head):
+            title2path[m.group(1).strip()] = rel
+    return url2path, title2path
+
+
+def _evidence_docs(row: dict, url2path: dict[str, str],
+                   title2path: dict[str, str]) -> tuple[list[str], int]:
+    """Resolve a question's gold evidence to corpus paths.
+
+    Returns (sorted unique paths the answer's support lives in, count of
+    evidence entries that could NOT be mapped). The path set is the retrieval
+    target for the doc-recall metric (eval/harness.py)."""
+    paths: set[str] = set()
+    unmapped = 0
+    for e in row.get("evidence_list", []):
+        p = url2path.get((e.get("url") or "").strip()) \
+            or title2path.get((e.get("title") or "").strip())
+        if p:
+            paths.add(p)
+        else:
+            unmapped += 1
+    return sorted(paths), unmapped
 
 
 def _pick(d: dict, keys: tuple[str, ...]) -> str | None:
@@ -62,7 +104,8 @@ MULTIHOPRAG_QA_URL = "https://huggingface.co/datasets/yixuantt/MultiHopRAG/resol
 def load_multihoprag(data_dir: str | Path = "data/multihoprag", *,
                      qa_file: str | Path | None = None,
                      limit: int | None = None,
-                     mode: str = "corpus") -> list[EvalItem]:
+                     mode: str = "corpus",
+                     embedder=None) -> list[EvalItem]:
     """Build EvalItems for MultiHopRAG over the materialized corpus.
 
     `mode="corpus"` points each item at the folder `Corpus` (RLM navigates
@@ -80,20 +123,31 @@ def load_multihoprag(data_dir: str | Path = "data/multihoprag", *,
         )
     qa = json.loads(qa_path.read_text(encoding="utf-8"))
 
+    # A Corpus over the same folder, used to map gold evidence -> file paths for
+    # the retrieval-recall metric. Built regardless of mount mode (the index is
+    # over the on-disk articles); in context mode the runner answers over the
+    # in-memory blob but recall is still measured against these paths.
+    corpus = Corpus(data_dir)
+    url2path, title2path = _build_evidence_index(corpus)
+
     if mode == "context":
-        corpus = Corpus(data_dir)
         docs = [corpus.read(p) for p in corpus.files()]
-        shared = Context(docs)
+        shared = Context(docs, embedder=embedder)
     else:
-        shared = Corpus(data_dir)
+        shared = Corpus(data_dir, embedder=embedder)
 
     items: list[EvalItem] = []
     for row in qa:
         q, a = _pick(row, _Q_KEYS), _pick(row, _A_KEYS)
         if q is None or a is None:
             continue
+        ev_docs, _ = _evidence_docs(row, url2path, title2path)
+        n_ev = len(row.get("evidence_list", []))
         items.append(EvalItem(question=q, answer=a, source=shared,
-                              meta={"type": row.get("question_type", "")}))
+                              meta={"type": row.get("question_type", ""),
+                                    "n_hops": n_ev,
+                                    "evidence_docs": ev_docs,
+                                    "is_null": n_ev == 0}))
         if limit is not None and len(items) >= limit:
             break
     return items

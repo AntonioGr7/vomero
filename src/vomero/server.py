@@ -348,8 +348,22 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def build_manager(settings: Settings, data: str) -> RunManager:
-    """Wire a RunManager from settings + a corpus path (interaction forced on)."""
-    corpus = Corpus(data)
+    """Wire a RunManager from settings + a corpus path (interaction forced on).
+
+    The corpus's search() uses, in precedence: an external retrieval service
+    (VOMERO_RETRIEVAL_URL → RemoteBackend, so the pod holds no vectors — the
+    multi-tenant path); else a prebuilt persistent index (VOMERO_INDEX_DIR,
+    opened read-only); else a lazy in-memory index. Embedder is for the local
+    dense paths only."""
+    from .context.retrieval import build_retrieval_backend
+    from .llm import build_embedder
+
+    corpus = Corpus(
+        data,
+        embedder=build_embedder(settings),
+        index_dir=settings.index_dir or None,
+        backend=build_retrieval_backend(settings),
+    )
     compactor = None
     if settings.compact_ratio > 0:
         compactor = Compactor(
@@ -369,7 +383,7 @@ def build_manager(settings: Settings, data: str) -> RunManager:
         compactor=compactor,
         enable_planning=settings.enable_planning,
         planning_root_only=settings.planning_root_only,
-        enable_interaction=True,  # the whole point of a remote client
+        enable_interaction=True, 
         interaction_root_only=settings.interaction_root_only,
     )
     # Persistent per-session envs so follow-ups resume variables + workspace.

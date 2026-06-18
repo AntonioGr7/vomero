@@ -65,6 +65,29 @@ class Settings:
     base_url: str | None = None
     api_key: str | None = None
 
+    # Optional dense retrieval for the source's search() primitive. When
+    # `embedding_model` is set, sources are built with an embedder (over the
+    # same OpenAI-compatible endpoint) and search() runs hybrid BM25+dense
+    # instead of BM25-only. Empty => lexical-only search (no embedding calls).
+    embedding_model: str = ""
+    embedding_base_url: str | None = None  # falls back to base_url
+    embedding_api_key: str | None = None   # falls back to api_key
+
+    # External retrieval service for search(). When `retrieval_url` is set, the
+    # process delegates ranking to it (a RemoteBackend) instead of building/
+    # loading a local index — so the vectors, the ANN index and the query-
+    # embedding all live in the service and this process holds no retrieval
+    # state (the scalable, multi-tenant path). Empty => local index.
+    retrieval_url: str = ""
+    retrieval_collection: str = ""
+    retrieval_api_key: str | None = None
+
+    # A prebuilt persistent index dir (see `vomero index`), opened read-only by
+    # search() when no external retrieval service is set. In a serving pod this
+    # is typically a read-only volume mounted next to the corpus. Empty => the
+    # lazy in-memory index (cold-start cost on first search).
+    index_dir: str = ""
+
     # RLM loop limits
     max_steps: int = 24
     max_depth: int = 3
@@ -161,6 +184,13 @@ class Settings:
                 or os.getenv("GEMINI_API_KEY")
                 or os.getenv("GOOGLE_API_KEY")
             ),
+            embedding_model=os.getenv("VOMERO_EMBEDDING_MODEL", ""),
+            embedding_base_url=os.getenv("VOMERO_EMBEDDING_BASE_URL") or None,
+            embedding_api_key=os.getenv("VOMERO_EMBEDDING_API_KEY") or None,
+            retrieval_url=os.getenv("VOMERO_RETRIEVAL_URL", ""),
+            retrieval_collection=os.getenv("VOMERO_RETRIEVAL_COLLECTION", ""),
+            retrieval_api_key=os.getenv("VOMERO_RETRIEVAL_API_KEY") or None,
+            index_dir=os.getenv("VOMERO_INDEX_DIR", ""),
             max_steps=int(os.getenv("VOMERO_MAX_STEPS", "24")),
             max_depth=int(os.getenv("VOMERO_MAX_DEPTH", "3")),
             max_output_chars=int(os.getenv("VOMERO_MAX_OUTPUT_CHARS", "10000")),

@@ -17,6 +17,7 @@ __all__ = [
     "ToolSpec",
     "Usage",
     "build_client",
+    "build_embedder",
 ]
 
 
@@ -47,4 +48,19 @@ def build_client(settings) -> LLMClient:
     raise ValueError(
         f"Unknown provider {provider!r}. Implemented: 'openai', 'gemini'. "
         "Add a client in vomero/llm/ that satisfies the LLMClient protocol."
+    )
+
+
+def build_embedder(settings):
+    """Factory: an `Embedder` for dense search when `embedding_model` is set,
+    else None (search stays pure-BM25). Reuses the main credentials unless the
+    embedding-specific overrides are given."""
+    if not getattr(settings, "embedding_model", ""):
+        return None
+    from .embeddings import OpenAIEmbedder
+
+    return OpenAIEmbedder(
+        model=settings.embedding_model,
+        base_url=settings.embedding_base_url or settings.base_url,
+        api_key=settings.embedding_api_key or settings.api_key,
     )
